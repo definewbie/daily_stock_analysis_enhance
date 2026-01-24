@@ -1,0 +1,90 @@
+# ============================================================
+# Claude Code context ignore list
+# Goal: reduce tokens by excluding large, generated, or irrelevant files
+# ============================================================
+
+# ----------------------------
+# Python virtual environments
+# ----------------------------
+venv/
+.venv/
+env/
+ENV/
+
+# ----------------------------
+# Python caches / test caches
+# ----------------------------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.coverage
+htmlcov/
+
+# ----------------------------
+# Build / packaging artifacts
+# ----------------------------
+dist/
+build/
+*.egg-info/
+.eggs/
+
+# ----------------------------
+# Runtime data / logs / local state
+# ----------------------------
+logs/
+log/
+*.log
+tmp/
+cache/
+runtime/
+output/
+outputs/
+artifacts/
+storage/
+*.sqlite
+*.sqlite3
+*.db
+
+# ----------------------------
+# Data files (typically large)
+# ----------------------------
+data/
+*.csv
+*.tsv
+*.parquet
+*.jsonl
+*.ndjson
+
+# ----------------------------
+# OS / IDE files
+# ----------------------------
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# ----------------------------
+# Large media / screenshots (repo-specific)
+# ----------------------------
+sources/
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.pdf
+
+# ----------------------------
+# Long docs not needed for coding (optional but enabled)
+# ----------------------------
+README.md
+DEPLOY.md
+CONTRIBUTING.md
+
+# If your docs are long and not needed for coding:
+docs/full-guide.md
