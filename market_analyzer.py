@@ -815,15 +815,92 @@ class MarketAnalyzer:
             logger.error(f"[雪球统计] 获取失败: {e}")
             return None, None
 
+    def _get_market_statistics_from_em_overview(self, overview: MarketOverview) -> bool:
+        """从东方财富市场概览 API 获取涨跌统计（首选方案）
+
+        优点：
+        - 直接返回统计结果，无需获取全量股票数据
+        - 响应快速，不易触发反爬
+        - 数据准确（官方统计）
+
+        Returns:
+            True 表示获取成功，False 表示失败
+        """
+        try:
+            url = 'https://push2.eastmoney.com/api/qt/ulist.np/get'
+            params = {
+                'fltt': '2',
+                # f104=上涨家数, f105=下跌家数, f106=平盘家数
+                # f107=涨停家数, f108=跌停家数, f6=成交额
+                'fields': 'f6,f104,f105,f106,f107,f108,f12,f14',
+                'secids': '1.000001,0.399001',  # 上证+深证
+                'ut': 'fa5fd1943c7b386f172d6893dbfba10b',
+            }
+
+            headers = {
+                'User-Agent': random.choice(_USER_AGENTS),
+                'Referer': 'https://quote.eastmoney.com/',
+            }
+
+            resp = requests.get(url, params=params, headers=headers, timeout=10)
+            if resp.status_code != 200:
+                logger.warning(f"[大盘统计] EM概览API请求失败: HTTP {resp.status_code}")
+                return False
+
+            data = resp.json()
+            if data.get('rc') != 0 or not data.get('data', {}).get('diff'):
+                logger.warning(f"[大盘统计] EM概览API返回异常: {data}")
+                return False
+
+            # 合并上证+深证数据
+            up_count = 0
+            down_count = 0
+            flat_count = 0
+            limit_up = 0
+            limit_down = 0
+            total_amount = 0.0
+
+            for item in data['data']['diff']:
+                up_count += item.get('f104', 0) or 0
+                down_count += item.get('f105', 0) or 0
+                flat_count += item.get('f106', 0) or 0
+                limit_up += item.get('f107', 0) or 0
+                limit_down += item.get('f108', 0) or 0
+                total_amount += item.get('f6', 0) or 0
+
+            overview.up_count = up_count
+            overview.down_count = down_count
+            overview.flat_count = flat_count
+            overview.limit_up_count = limit_up
+            overview.limit_down_count = limit_down
+            overview.total_amount = total_amount / 1e8  # 转为"亿"
+
+            logger.info(
+                f"[大盘] 涨:{overview.up_count} 跌:{overview.down_count} 平:{overview.flat_count} "
+                f"涨停:{overview.limit_up_count} 跌停:{overview.limit_down_count} "
+                f"成交额:{overview.total_amount:.0f}亿 (source=em_overview)"
+            )
+            return True
+
+        except Exception as e:
+            logger.warning(f"[大盘统计] EM概览API获取失败: {e}")
+            return False
+
     def _get_market_statistics(self, overview: MarketOverview):
-        """获取市场涨跌统计（新浪优先，EM备选，雪球兜底）"""
+        """获取市场涨跌统计（EM概览优先 → 新浪 → EM批量 → 雪球）"""
         try:
             logger.info("[大盘] 获取市场涨跌统计...")
 
-            # 数据源优先级：新浪 > EM > 雪球（新浪更稳定，EM容易被反爬block，雪球作为兜底）
+            # 方法1: 东方财富概览 API（首选，直接返回统计结果）
+            if self._get_market_statistics_from_em_overview(overview):
+                return
+
+            logger.warning("[大盘] EM概览API失败，尝试批量接口...")
+
+            # 方法2: 批量获取全量数据计算（fallback）
             sources = [
-                ("stock_zh_a_spot", "sina"),          # 新浪优先（更稳定）
-                ("stock_zh_a_spot_em", "em"),         # EM作为备选
+                ("stock_zh_a_spot", "sina"),          # 新浪
+                ("stock_zh_a_spot_em", "em"),         # EM批量
             ]
 
             df, source = self._fetch_with_fallback(sources, "A股实时行情")
