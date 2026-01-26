@@ -1092,62 +1092,135 @@ class GeminiAnalyzer:
     def _fix_json_string(self, json_str: str) -> str:
         """修复常见的 JSON 格式问题"""
         import re
-        
+
         # 移除注释
         json_str = re.sub(r'//.*?\n', '\n', json_str)
         json_str = re.sub(r'/\*.*?\*/', '', json_str, flags=re.DOTALL)
-        
+
         # 修复尾随逗号
         json_str = re.sub(r',\s*}', '}', json_str)
         json_str = re.sub(r',\s*]', ']', json_str)
-        
+
         # 确保布尔值是小写
         json_str = json_str.replace('True', 'true').replace('False', 'false')
-        
+
+        # 修复缺失的逗号（在 } 或 ] 后面紧跟 " 的情况）
+        json_str = re.sub(r'}\s*"', '}, "', json_str)
+        json_str = re.sub(r']\s*"', '], "', json_str)
+
+        # 修复字符串中的换行符
+        json_str = re.sub(r'(?<!\\)\n', '\\n', json_str)
+
+        # 移除控制字符
+        json_str = re.sub(r'[\x00-\x1f\x7f]', '', json_str)
+
         return json_str
     
     def _parse_text_response(
-        self, 
-        response_text: str, 
-        code: str, 
+        self,
+        response_text: str,
+        code: str,
         name: str
     ) -> AnalysisResult:
-        """从纯文本响应中尽可能提取分析信息"""
+        """从纯文本响应中尽可能提取分析信息（增强版：尝试提取部分 JSON）"""
+        import re
+
         # 尝试识别关键词来判断情绪
         sentiment_score = 50
         trend = '震荡'
         advice = '持有'
-        
+        dashboard = None
+        one_sentence = ''
+
         text_lower = response_text.lower()
-        
-        # 简单的情绪识别
-        positive_keywords = ['看多', '买入', '上涨', '突破', '强势', '利好', '加仓', 'bullish', 'buy']
-        negative_keywords = ['看空', '卖出', '下跌', '跌破', '弱势', '利空', '减仓', 'bearish', 'sell']
-        
-        positive_count = sum(1 for kw in positive_keywords if kw in text_lower)
-        negative_count = sum(1 for kw in negative_keywords if kw in text_lower)
-        
-        if positive_count > negative_count + 1:
-            sentiment_score = 65
-            trend = '看多'
-            advice = '买入'
-        elif negative_count > positive_count + 1:
-            sentiment_score = 35
-            trend = '看空'
-            advice = '卖出'
-        
-        # 截取前500字符作为摘要
-        summary = response_text[:500] if response_text else '无分析结果'
-        
+
+        # 尝试从响应中提取关键字段（即使完整 JSON 解析失败）
+        try:
+            # 提取 sentiment_score
+            score_match = re.search(r'"sentiment_score"\s*:\s*(\d+)', response_text)
+            if score_match:
+                sentiment_score = int(score_match.group(1))
+
+            # 提取 trend_prediction
+            trend_match = re.search(r'"trend_prediction"\s*:\s*"([^"]+)"', response_text)
+            if trend_match:
+                trend = trend_match.group(1)
+
+            # 提取 operation_advice
+            advice_match = re.search(r'"operation_advice"\s*:\s*"([^"]+)"', response_text)
+            if advice_match:
+                advice = advice_match.group(1)
+
+            # 提取 one_sentence（核心一句话决策）
+            one_sentence_match = re.search(r'"one_sentence"\s*:\s*"([^"]+)"', response_text)
+            if one_sentence_match:
+                one_sentence = one_sentence_match.group(1)
+
+            # 尝试提取 dashboard 中的关键子对象
+            dashboard = {}
+
+            # 提取 core_conclusion
+            core_match = re.search(r'"core_conclusion"\s*:\s*\{([^}]+(?:\{[^}]*\}[^}]*)*)\}', response_text)
+            if core_match:
+                try:
+                    core_json = '{' + core_match.group(1) + '}'
+                    core_json = self._fix_json_string(core_json)
+                    dashboard['core_conclusion'] = json.loads(core_json)
+                except:
+                    # 至少设置 one_sentence
+                    if one_sentence:
+                        dashboard['core_conclusion'] = {'one_sentence': one_sentence}
+
+            # 提取 position_advice
+            pos_match = re.search(r'"position_advice"\s*:\s*\{([^}]+)\}', response_text)
+            if pos_match:
+                try:
+                    pos_json = '{' + pos_match.group(1) + '}'
+                    pos_json = self._fix_json_string(pos_json)
+                    pos_data = json.loads(pos_json)
+                    if 'core_conclusion' not in dashboard:
+                        dashboard['core_conclusion'] = {}
+                    dashboard['core_conclusion']['position_advice'] = pos_data
+                except:
+                    pass
+
+            # 如果没有提取到任何 dashboard 内容，设置为 None
+            if not dashboard:
+                dashboard = None
+
+        except Exception as e:
+            logger.debug(f"从文本提取字段失败: {e}")
+
+        # 如果没有提取到趋势/建议，使用关键词判断
+        if trend == '震荡' and advice == '持有':
+            positive_keywords = ['看多', '买入', '上涨', '突破', '强势', '利好', '加仓', 'bullish', 'buy']
+            negative_keywords = ['看空', '卖出', '下跌', '跌破', '弱势', '利空', '减仓', 'bearish', 'sell']
+
+            positive_count = sum(1 for kw in positive_keywords if kw in text_lower)
+            negative_count = sum(1 for kw in negative_keywords if kw in text_lower)
+
+            if positive_count > negative_count + 1:
+                sentiment_score = max(sentiment_score, 65)
+                trend = '看多'
+                advice = '买入'
+            elif negative_count > positive_count + 1:
+                sentiment_score = min(sentiment_score, 35)
+                trend = '看空'
+                advice = '卖出'
+
+        # 设置摘要（优先使用提取的 one_sentence）
+        summary = one_sentence if one_sentence else '分析完成'
+
         return AnalysisResult(
             code=code,
             name=name,
             sentiment_score=sentiment_score,
             trend_prediction=trend,
             operation_advice=advice,
-            confidence_level='低',
+            confidence_level='中' if one_sentence else '低',
+            dashboard=dashboard,
             analysis_summary=summary,
-            key_points='JSON解析失败，仅供参考',
+            key_points='部分解析成功' if one_sentence else 'JSON解析失败，仅供参考',
             risk_warning='分析结果可能不准确，建议结合其他信息判断',
             raw_response=response_text,
             success=True,

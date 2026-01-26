@@ -738,52 +738,67 @@ def parse_arguments() -> argparse.Namespace:
 def run_market_review(notifier: NotificationService, analyzer=None, search_service=None) -> Optional[str]:
     """
     执行大盘复盘分析
-    
+
     Args:
         notifier: 通知服务
         analyzer: AI分析器（可选）
         search_service: 搜索服务（可选）
-    
+
     Returns:
         复盘报告文本
     """
     logger.info("开始执行大盘复盘分析...")
-    
+
     try:
         market_analyzer = MarketAnalyzer(
             search_service=search_service,
             analyzer=analyzer
         )
-        
-        # 执行复盘
-        review_report = market_analyzer.run_daily_review()
-        
+
+        # 1. 获取市场概览数据
+        overview = market_analyzer.get_market_overview()
+
+        # 2. 搜索市场新闻
+        news = market_analyzer.search_market_news()
+
+        # 3. 生成 AI 复盘报告
+        review_report = market_analyzer.generate_market_review(overview, news)
+
         if review_report:
             # 保存报告到文件
             date_str = datetime.now().strftime('%Y%m%d')
             report_filename = f"market_review_{date_str}.md"
             filepath = notifier.save_report_to_file(
-                f"# 🎯 大盘复盘\n\n{review_report}", 
+                f"# 🎯 大盘复盘\n\n{review_report}",
                 report_filename
             )
             logger.info(f"大盘复盘报告已保存: {filepath}")
-            
-            # 推送通知
+
+            # 推送通知（使用美化的飞书卡片）
             if notifier.is_available():
-                # 添加标题
-                report_content = f"🎯 大盘复盘\n\n{review_report}"
-                
-                success = notifier.send(report_content)
-                if success:
-                    logger.info("大盘复盘推送成功")
+                # 优先使用飞书卡片格式（结构化展示）
+                feishu_success = notifier.send_market_review_to_feishu(
+                    overview=overview,
+                    ai_analysis=review_report,
+                    report_date=overview.date
+                )
+
+                if feishu_success:
+                    logger.info("大盘复盘飞书卡片推送成功")
                 else:
-                    logger.warning("大盘复盘推送失败")
-            
+                    # 飞书卡片失败，尝试其他渠道
+                    report_content = f"🎯 大盘复盘\n\n{review_report}"
+                    success = notifier.send(report_content)
+                    if success:
+                        logger.info("大盘复盘推送成功")
+                    else:
+                        logger.warning("大盘复盘推送失败")
+
             return review_report
-        
+
     except Exception as e:
         logger.error(f"大盘复盘分析失败: {e}")
-    
+
     return None
 
 

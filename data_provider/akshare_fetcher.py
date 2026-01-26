@@ -574,97 +574,332 @@ class AkshareFetcher(BaseFetcher):
     def _get_stock_realtime_quote(self, stock_code: str) -> Optional[RealtimeQuote]:
         """
         获取普通 A 股实时行情数据
-        
-        数据来源：ak.stock_zh_a_spot_em()
-        包含：量比、换手率、市盈率、市净率、总市值、流通市值等
+
+        数据来源优先级：
+        1. ak.stock_zh_a_spot_em() - EM接口，字段最全（量比、换手率、PE、PB、市值等）
+        2. ak.stock_zh_a_spot() - 新浪接口，字段较少但更稳定（fallback）
         """
         import akshare as ak
-        
+
+        # 安全获取字段值
+        def safe_float(val, default=0.0):
+            try:
+                if pd.isna(val):
+                    return default
+                return float(val)
+            except:
+                return default
+
         try:
             # 检查缓存
             current_time = time.time()
-            if (_realtime_cache['data'] is not None and 
+            if (_realtime_cache['data'] is not None and
                 current_time - _realtime_cache['timestamp'] < _realtime_cache['ttl']):
                 df = _realtime_cache['data']
-                logger.debug(f"[缓存命中] 使用缓存的A股实时行情数据")
+                source = _realtime_cache.get('source', 'cache')
+                logger.debug(f"[缓存命中] 使用缓存的A股实时行情数据 (source={source})")
             else:
-                last_error: Optional[Exception] = None
+                # 多数据源 fallback 策略：EM优先（数据全），新浪备选（更稳定）
+                sources = [
+                    ("stock_zh_a_spot_em", "em"),      # EM优先，字段最全
+                    ("stock_zh_a_spot", "sina"),       # 新浪备选，更稳定
+                ]
+
                 df = None
-                for attempt in range(1, 3):
-                    try:
-                        # 防封禁策略
-                        self._set_random_user_agent()
-                        self._enforce_rate_limit()
+                source = None
+                last_error = None
 
-                        logger.info(f"[API调用] ak.stock_zh_a_spot_em() 获取A股实时行情... (attempt {attempt}/2)")
-                        import time as _time
-                        api_start = _time.time()
+                for fn_name, source_label in sources:
+                    fn = getattr(ak, fn_name, None)
+                    if fn is None:
+                        logger.debug(f"[API] {fn_name} 在当前AkShare版本不可用，跳过")
+                        continue
 
-                        df = ak.stock_zh_a_spot_em()
+                    # 每个数据源尝试2次
+                    for attempt in range(1, 3):
+                        try:
+                            self._set_random_user_agent()
+                            self._enforce_rate_limit()
 
-                        api_elapsed = _time.time() - api_start
-                        logger.info(f"[API返回] ak.stock_zh_a_spot_em 成功: 返回 {len(df)} 只股票, 耗时 {api_elapsed:.2f}s")
-                        break
-                    except Exception as e:
-                        last_error = e
-                        logger.warning(f"[API错误] ak.stock_zh_a_spot_em 获取失败 (attempt {attempt}/2): {e}")
-                        time.sleep(min(2 ** attempt, 5))
+                            logger.info(f"[API调用] ak.{fn_name}() 获取A股实时行情... (attempt {attempt}/2)")
+                            import time as _time
+                            api_start = _time.time()
 
-                # 更新缓存：成功缓存数据；失败也缓存空数据，避免同一轮任务对同一接口反复请求
-                if df is None:
-                    logger.error(f"[API错误] ak.stock_zh_a_spot_em 最终失败: {last_error}")
+                            df = fn()
+
+                            api_elapsed = _time.time() - api_start
+                            if df is not None and not df.empty:
+                                logger.info(f"[API返回] ak.{fn_name} 成功: 返回 {len(df)} 只股票, 耗时 {api_elapsed:.2f}s")
+                                source = source_label
+                                break
+                        except Exception as e:
+                            last_error = e
+                            logger.warning(f"[API错误] ak.{fn_name} 获取失败 (attempt {attempt}/2): {e}")
+                            time.sleep(min(2 ** attempt, 5))
+
+                    if df is not None and not df.empty:
+                        break  # 成功获取，退出数据源循环
+                    else:
+                        logger.warning(f"[API] {fn_name} 所有尝试失败，尝试下一个数据源...")
+
+                # 更新缓存
+                if df is None or df.empty:
+                    logger.error(f"[API错误] 所有数据源获取A股实时行情失败: {last_error}")
                     df = pd.DataFrame()
+                    source = None
+
                 _realtime_cache['data'] = df
                 _realtime_cache['timestamp'] = current_time
+                _realtime_cache['source'] = source
 
+            # 如果批量接口都失败，尝试雪球单股接口
             if df is None or df.empty:
-                logger.warning(f"[实时行情] A股实时行情数据为空，跳过 {stock_code}")
-                return None
-            
+                logger.warning(f"[实时行情] 批量接口失败，尝试雪球单股接口获取 {stock_code}")
+                return self._get_realtime_from_xueqiu(stock_code)
+
             # 查找指定股票
             row = df[df['代码'] == stock_code]
             if row.empty:
-                logger.warning(f"[API返回] 未找到股票 {stock_code} 的实时行情")
-                return None
-            
+                # 批量数据中没有该股票，尝试雪球单股接口
+                logger.warning(f"[API返回] 批量数据中未找到 {stock_code}，尝试雪球单股接口")
+                return self._get_realtime_from_xueqiu(stock_code)
+
             row = row.iloc[0]
-            
-            # 安全获取字段值
-            def safe_float(val, default=0.0):
-                try:
-                    if pd.isna(val):
-                        return default
-                    return float(val)
-                except:
-                    return default
-            
+
+            # 根据数据源选择字段映射（新浪接口缺少部分字段）
+            source = _realtime_cache.get('source', 'em')
+
             quote = RealtimeQuote(
                 code=stock_code,
                 name=str(row.get('名称', '')),
                 price=safe_float(row.get('最新价')),
                 change_pct=safe_float(row.get('涨跌幅')),
                 change_amount=safe_float(row.get('涨跌额')),
-                volume_ratio=safe_float(row.get('量比')),
-                turnover_rate=safe_float(row.get('换手率')),
-                amplitude=safe_float(row.get('振幅')),
-                pe_ratio=safe_float(row.get('市盈率-动态')),
-                pb_ratio=safe_float(row.get('市净率')),
-                total_mv=safe_float(row.get('总市值')),
-                circ_mv=safe_float(row.get('流通市值')),
-                change_60d=safe_float(row.get('60日涨跌幅')),
-                high_52w=safe_float(row.get('52周最高')),
-                low_52w=safe_float(row.get('52周最低')),
+                # 以下字段新浪接口可能没有，使用默认值0
+                volume_ratio=safe_float(row.get('量比', 0)),
+                turnover_rate=safe_float(row.get('换手率', 0)),
+                amplitude=safe_float(row.get('振幅', 0)),
+                pe_ratio=safe_float(row.get('市盈率-动态', 0)),
+                pb_ratio=safe_float(row.get('市净率', 0)),
+                total_mv=safe_float(row.get('总市值', 0)),
+                circ_mv=safe_float(row.get('流通市值', 0)),
+                change_60d=safe_float(row.get('60日涨跌幅', 0)),
+                high_52w=safe_float(row.get('52周最高', 0)),
+                low_52w=safe_float(row.get('52周最低', 0)),
             )
-            
-            logger.info(f"[实时行情] {stock_code} {quote.name}: 价格={quote.price}, 涨跌={quote.change_pct}%, "
+
+            # 当使用新浪数据源时，调用雪球接口补充缺失字段
+            if source == "sina":
+                xq_data = self._fetch_xq_supplement(stock_code)
+                if xq_data:
+                    quote.volume_ratio = xq_data.get('volume_ratio', quote.volume_ratio)
+                    quote.turnover_rate = xq_data.get('turnover_rate', quote.turnover_rate)
+                    quote.amplitude = xq_data.get('amplitude', quote.amplitude)
+                    quote.pe_ratio = xq_data.get('pe_ratio', quote.pe_ratio)
+                    quote.pb_ratio = xq_data.get('pb_ratio', quote.pb_ratio)
+                    quote.total_mv = xq_data.get('total_mv', quote.total_mv)
+                    quote.circ_mv = xq_data.get('circ_mv', quote.circ_mv)
+                    quote.high_52w = xq_data.get('high_52w', quote.high_52w)
+                    quote.low_52w = xq_data.get('low_52w', quote.low_52w)
+                    source = "sina+xq"  # 标记数据来源
+
+            logger.info(f"[实时行情] {stock_code} {quote.name} (source={source}): 价格={quote.price}, 涨跌={quote.change_pct}%, "
                        f"量比={quote.volume_ratio}, 换手率={quote.turnover_rate}%, "
                        f"PE={quote.pe_ratio}, PB={quote.pb_ratio}")
             return quote
-            
+
         except Exception as e:
             logger.error(f"[API错误] 获取 {stock_code} 实时行情失败: {e}")
             return None
-    
+
+    def _fetch_xq_supplement(self, stock_code: str) -> Optional[Dict[str, float]]:
+        """
+        直接调用雪球原始 API 获取完整数据（补充新浪接口缺失的字段）
+
+        雪球 API 提供：量比、换手率、振幅、PE、PB、市值、52周高低等
+        注意：akshare 的封装漏掉了 volume_ratio 字段，所以直接调用原始 API
+
+        Args:
+            stock_code: 股票代码（纯数字，如 000001）
+
+        Returns:
+            包含补充字段的字典，失败返回 None
+        """
+        import requests
+
+        try:
+            # 转换股票代码格式：000001 -> SZ000001, 600001 -> SH600001
+            if stock_code.startswith(('0', '3')):
+                symbol = f"SZ{stock_code}"
+            elif stock_code.startswith(('6', '9')):
+                symbol = f"SH{stock_code}"
+            elif stock_code.startswith(('4', '8')):
+                symbol = f"BJ{stock_code}"  # 北交所
+            else:
+                symbol = f"SZ{stock_code}"  # 默认深市
+
+            # 获取雪球 token（从 akshare 内置配置）
+            try:
+                from akshare.stock.cons import xq_a_token
+            except ImportError:
+                logger.warning("[雪球补充] 无法获取雪球 token，跳过补充")
+                return None
+
+            session = requests.Session()
+            headers = {
+                'cookie': f'xq_a_token={xq_a_token};',
+                'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 '
+                              '(KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
+            }
+
+            # 先访问主页获取必要的 cookie
+            session.get('https://xueqiu.com', headers=headers, timeout=5)
+
+            # 调用雪球 API
+            url = f'https://stock.xueqiu.com/v5/stock/quote.json?symbol={symbol}&extend=detail'
+            response = session.get(url, headers=headers, timeout=10)
+
+            if response.status_code != 200:
+                logger.warning(f"[雪球补充] API 请求失败: HTTP {response.status_code}")
+                return None
+
+            data = response.json()
+            quote = data.get('data', {}).get('quote', {})
+
+            if not quote:
+                logger.warning(f"[雪球补充] {stock_code} 返回数据为空")
+                return None
+
+            # 提取需要的字段
+            def safe_float(val, default=0.0):
+                try:
+                    if val is None:
+                        return default
+                    return float(val)
+                except:
+                    return default
+
+            result = {
+                'volume_ratio': safe_float(quote.get('volume_ratio')),      # 量比
+                'turnover_rate': safe_float(quote.get('turnover_rate')),    # 换手率
+                'amplitude': safe_float(quote.get('amplitude')),             # 振幅
+                'pe_ratio': safe_float(quote.get('pe_forecast')),           # 市盈率(动态)
+                'pb_ratio': safe_float(quote.get('pb')),                    # 市净率
+                'total_mv': safe_float(quote.get('market_capital')),        # 总市值
+                'circ_mv': safe_float(quote.get('float_market_capital')),   # 流通市值
+                'high_52w': safe_float(quote.get('high52w')),               # 52周最高
+                'low_52w': safe_float(quote.get('low52w')),                 # 52周最低
+            }
+
+            logger.info(f"[雪球补充] {stock_code} 补充成功: 量比={result['volume_ratio']}, "
+                       f"换手率={result['turnover_rate']}%, PE={result['pe_ratio']}, PB={result['pb_ratio']}")
+
+            return result
+
+        except requests.exceptions.Timeout:
+            logger.warning(f"[雪球补充] {stock_code} 请求超时，跳过补充")
+            return None
+        except Exception as e:
+            logger.warning(f"[雪球补充] {stock_code} 获取失败: {e}")
+            return None
+
+    def _get_realtime_from_xueqiu(self, stock_code: str) -> Optional[RealtimeQuote]:
+        """
+        从腾讯财经 API 获取单股实时行情（当批量接口失败时的备选方案）
+
+        注意：由于雪球 API 需要动态 token，改用腾讯财经 API 作为备选
+        腾讯 API 优点：
+        - 无需认证，稳定可靠
+        - 数据字段完整（换手率、PE、PB、市值、振幅等）
+
+        Args:
+            stock_code: 股票代码（纯数字，如 000001）
+
+        Returns:
+            RealtimeQuote 对象，失败返回 None
+        """
+        import requests
+        import re
+
+        try:
+            # 转换股票代码格式：000001 -> sz000001, 600001 -> sh600001
+            if stock_code.startswith(('0', '3')):
+                symbol = f"sz{stock_code}"
+            elif stock_code.startswith(('6', '9')):
+                symbol = f"sh{stock_code}"
+            elif stock_code.startswith(('4', '8')):
+                symbol = f"bj{stock_code}"  # 北交所
+            else:
+                symbol = f"sz{stock_code}"  # 默认深市
+
+            # 腾讯股票数据接口
+            url = f'https://qt.gtimg.cn/q={symbol}'
+            headers = {
+                'User-Agent': random.choice(USER_AGENTS),
+                'Referer': 'https://gu.qq.com/',
+            }
+
+            logger.info(f"[腾讯单股] 获取 {stock_code} 实时行情")
+            response = requests.get(url, headers=headers, timeout=10)
+
+            if response.status_code != 200:
+                logger.warning(f"[腾讯单股] API 请求失败: HTTP {response.status_code}")
+                return None
+
+            text = response.text
+
+            # 解析数据格式：v_sz000001="1~平安银行~000001~12.34~..."
+            match = re.search(r'v_[a-z]{2}\d+="([^"]+)"', text)
+            if not match:
+                logger.warning(f"[腾讯单股] 无法解析返回数据: {text[:100]}")
+                return None
+
+            parts = match.group(1).split('~')
+            if len(parts) < 50:
+                logger.warning(f"[腾讯单股] 数据字段不足: {len(parts)}")
+                return None
+
+            # 安全获取字段值
+            def safe_float(val, default=0.0):
+                try:
+                    if val is None or val == '':
+                        return default
+                    return float(val)
+                except:
+                    return default
+
+            # 腾讯数据字段解析（索引从0开始）
+            # 1-名称, 3-现价, 31-涨跌额, 32-涨跌幅, 33-最高, 34-最低
+            # 38-换手率, 39-市盈率(动态), 43-振幅
+            # 44-流通市值(亿), 45-总市值(亿), 46-市净率
+            # 47-涨停价, 48-跌停价
+
+            quote = RealtimeQuote(
+                code=stock_code,
+                name=str(parts[1]) if len(parts) > 1 else '',
+                price=safe_float(parts[3]) if len(parts) > 3 else 0.0,
+                change_pct=safe_float(parts[32]) if len(parts) > 32 else 0.0,
+                change_amount=safe_float(parts[31]) if len(parts) > 31 else 0.0,
+                volume_ratio=0.0,  # 腾讯接口不提供量比
+                turnover_rate=safe_float(parts[38]) if len(parts) > 38 else 0.0,
+                amplitude=safe_float(parts[43]) if len(parts) > 43 else 0.0,
+                pe_ratio=safe_float(parts[39]) if len(parts) > 39 else 0.0,
+                pb_ratio=safe_float(parts[46]) if len(parts) > 46 else 0.0,
+                total_mv=safe_float(parts[45]) * 1e8 if len(parts) > 45 else 0.0,  # 亿 -> 元
+                circ_mv=safe_float(parts[44]) * 1e8 if len(parts) > 44 else 0.0,  # 亿 -> 元
+                change_60d=0.0,  # 腾讯接口不提供
+                high_52w=0.0,  # 腾讯接口不提供
+                low_52w=0.0,  # 腾讯接口不提供
+            )
+
+            logger.info(f"[腾讯单股] {stock_code} {quote.name}: 价格={quote.price}, 涨跌={quote.change_pct}%, "
+                       f"换手率={quote.turnover_rate}%, PE={quote.pe_ratio}, PB={quote.pb_ratio}")
+            return quote
+
+        except Exception as e:
+            logger.error(f"[腾讯单股] 获取 {stock_code} 实时行情失败: {e}")
+            return None
+
     def _get_etf_realtime_quote(self, stock_code: str) -> Optional[RealtimeQuote]:
         """
         获取 ETF 基金实时行情数据

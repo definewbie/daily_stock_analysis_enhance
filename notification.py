@@ -253,10 +253,18 @@ class NotificationService:
             reverse=True
         )
         
-        # 统计信息
-        buy_count = sum(1 for r in results if r.operation_advice in ['买入', '加仓', '强烈买入'])
-        sell_count = sum(1 for r in results if r.operation_advice in ['卖出', '减仓', '强烈卖出'])
-        hold_count = sum(1 for r in results if r.operation_advice in ['持有', '观望'])
+        # 统计信息（使用 _get_signal_level 保持与显示一致）
+        buy_count = 0
+        sell_count = 0
+        hold_count = 0
+        for r in results:
+            signal_text, _, _ = self._get_signal_level(r)
+            if signal_text in ['强烈买入', '买入']:
+                buy_count += 1
+            elif signal_text in ['卖出', '减仓']:
+                sell_count += 1
+            else:
+                hold_count += 1
         avg_score = sum(r.sentiment_score for r in results) / len(results) if results else 0
         
         report_lines.extend([
@@ -458,11 +466,19 @@ class NotificationService:
         
         # 按评分排序（高分在前）
         sorted_results = sorted(results, key=lambda x: x.sentiment_score, reverse=True)
-        
-        # 统计信息
-        buy_count = sum(1 for r in results if r.operation_advice in ['买入', '加仓', '强烈买入'])
-        sell_count = sum(1 for r in results if r.operation_advice in ['卖出', '减仓', '强烈卖出'])
-        hold_count = sum(1 for r in results if r.operation_advice in ['持有', '观望'])
+
+        # 统计信息（使用 _get_signal_level 保持与显示一致）
+        buy_count = 0
+        sell_count = 0
+        hold_count = 0
+        for r in results:
+            signal_text, _, _ = self._get_signal_level(r)
+            if signal_text in ['强烈买入', '买入']:
+                buy_count += 1
+            elif signal_text in ['卖出', '减仓']:
+                sell_count += 1
+            else:  # 持有、观望
+                hold_count += 1
         
         report_lines = [
             f"# 🎯 {report_date} 决策仪表盘",
@@ -718,19 +734,27 @@ class NotificationService:
         
         # 按评分排序
         sorted_results = sorted(results, key=lambda x: x.sentiment_score, reverse=True)
-        
-        # 统计
-        buy_count = sum(1 for r in results if r.operation_advice in ['买入', '加仓', '强烈买入'])
-        sell_count = sum(1 for r in results if r.operation_advice in ['卖出', '减仓', '强烈卖出'])
-        hold_count = sum(1 for r in results if r.operation_advice in ['持有', '观望'])
-        
+
+        # 统计（使用 _get_signal_level 保持与显示一致）
+        buy_count = 0
+        sell_count = 0
+        hold_count = 0
+        for r in results:
+            signal_text, _, _ = self._get_signal_level(r)
+            if signal_text in ['强烈买入', '买入']:
+                buy_count += 1
+            elif signal_text in ['卖出', '减仓']:
+                sell_count += 1
+            else:
+                hold_count += 1
+
         lines = [
             f"## 🎯 {report_date} 决策仪表盘",
             "",
             f"> {len(results)}只股票 | 🟢买入:{buy_count} 🟡观望:{hold_count} 🔴卖出:{sell_count}",
             "",
         ]
-        
+
         for result in sorted_results:
             signal_text, signal_emoji, _ = self._get_signal_level(result)
             dashboard = result.dashboard if hasattr(result, 'dashboard') and result.dashboard else {}
@@ -856,13 +880,21 @@ class NotificationService:
         
         # 按评分排序
         sorted_results = sorted(results, key=lambda x: x.sentiment_score, reverse=True)
-        
-        # 统计
-        buy_count = sum(1 for r in results if r.operation_advice in ['买入', '加仓', '强烈买入'])
-        sell_count = sum(1 for r in results if r.operation_advice in ['卖出', '减仓', '强烈卖出'])
-        hold_count = sum(1 for r in results if r.operation_advice in ['持有', '观望'])
+
+        # 统计（使用 _get_signal_level 保持与显示一致）
+        buy_count = 0
+        sell_count = 0
+        hold_count = 0
+        for r in results:
+            signal_text, _, _ = self._get_signal_level(r)
+            if signal_text in ['强烈买入', '买入']:
+                buy_count += 1
+            elif signal_text in ['卖出', '减仓']:
+                sell_count += 1
+            else:
+                hold_count += 1
         avg_score = sum(r.sentiment_score for r in results) / len(results) if results else 0
-        
+
         lines = [
             f"## 📅 {report_date} A股分析报告",
             "",
@@ -1303,7 +1335,247 @@ class NotificationService:
         except Exception as e:
             logger.error(f"发送飞书消息失败: {e}")
             return False
-    
+
+    def send_market_review_to_feishu(
+        self,
+        overview: Any,
+        ai_analysis: str = "",
+        report_date: Optional[str] = None
+    ) -> bool:
+        """
+        发送大盘复盘到飞书（美化卡片格式，与决策仪表盘统一风格）
+
+        Args:
+            overview: MarketOverview 对象（包含指数、涨跌统计、板块数据）
+            ai_analysis: AI 生成的分析文本
+            report_date: 报告日期（默认今天）
+
+        Returns:
+            是否发送成功
+        """
+        if not self._feishu_url:
+            logger.warning("飞书 Webhook 未配置，跳过推送")
+            return False
+
+        if report_date is None:
+            report_date = datetime.now().strftime('%Y-%m-%d')
+
+        try:
+            # 判断市场涨跌（基于上证指数）
+            sh_index = None
+            if hasattr(overview, 'indices') and overview.indices:
+                sh_index = next((idx for idx in overview.indices if 'sh000001' in idx.code or '上证' in idx.name), None)
+                if not sh_index:
+                    sh_index = overview.indices[0] if overview.indices else None
+
+            market_up = sh_index.change_pct >= 0 if sh_index else True
+            header_color = "green" if market_up else "red"
+            market_emoji = "📈" if market_up else "📉"
+
+            # ========== 构建卡片元素 ==========
+            elements = []
+
+            # --- 1. 市场情绪概览 ---
+            if hasattr(overview, 'up_count'):
+                total = overview.up_count + overview.down_count + overview.flat_count
+                up_ratio = (overview.up_count / total * 100) if total > 0 else 0
+                mood_text = "🟢 多方占优" if up_ratio > 55 else "🔴 空方占优" if up_ratio < 45 else "⚖️ 多空平衡"
+
+                elements.append({
+                    "tag": "div",
+                    "text": {
+                        "tag": "lark_md",
+                        "content": f"**{mood_text}** | 上涨 {overview.up_count} 家 · 下跌 {overview.down_count} 家 · 平盘 {overview.flat_count} 家"
+                    }
+                })
+                elements.append({"tag": "hr"})
+
+            # --- 2. 主要指数（多列布局）---
+            if hasattr(overview, 'indices') and overview.indices:
+                elements.append({
+                    "tag": "div",
+                    "text": {"tag": "lark_md", "content": "**📊 主要指数**"}
+                })
+
+                # 每行最多3个指数
+                indices_to_show = overview.indices[:6]
+                for i in range(0, len(indices_to_show), 3):
+                    batch = indices_to_show[i:i+3]
+                    columns = []
+                    for idx in batch:
+                        direction = "🔺" if idx.change_pct > 0 else "🔻" if idx.change_pct < 0 else "➖"
+                        color = "green" if idx.change_pct > 0 else "red" if idx.change_pct < 0 else "grey"
+                        columns.append({
+                            "tag": "column",
+                            "width": "weighted",
+                            "weight": 1,
+                            "elements": [{
+                                "tag": "div",
+                                "text": {
+                                    "tag": "lark_md",
+                                    "content": f"**{idx.name}**\n{idx.current:.2f}\n{direction} {idx.change_pct:+.2f}%"
+                                }
+                            }]
+                        })
+                    # 补齐空列
+                    while len(columns) < 3:
+                        columns.append({
+                            "tag": "column",
+                            "width": "weighted",
+                            "weight": 1,
+                            "elements": [{"tag": "div", "text": {"tag": "plain_text", "content": ""}}]
+                        })
+                    elements.append({
+                        "tag": "column_set",
+                        "flex_mode": "none",
+                        "background_style": "default",
+                        "columns": columns
+                    })
+
+                elements.append({"tag": "hr"})
+
+            # --- 3. 涨跌统计 ---
+            if hasattr(overview, 'limit_up_count'):
+                stats_text = (
+                    f"**🎯 涨跌统计**\n"
+                    f"涨停 **{overview.limit_up_count}** 家 | 跌停 **{overview.limit_down_count}** 家\n"
+                    f"成交额 **{overview.total_amount:.0f}** 亿"
+                )
+                if hasattr(overview, 'north_flow') and overview.north_flow != 0:
+                    flow_direction = "流入" if overview.north_flow > 0 else "流出"
+                    stats_text += f" | 北向 **{abs(overview.north_flow):.2f}** 亿 ({flow_direction})"
+
+                elements.append({
+                    "tag": "div",
+                    "text": {"tag": "lark_md", "content": stats_text}
+                })
+                elements.append({"tag": "hr"})
+
+            # --- 4. 板块表现 ---
+            if hasattr(overview, 'top_sectors') and overview.top_sectors:
+                top_list = []
+                for s in overview.top_sectors[:5]:
+                    name = s.get('name', '')
+                    chg = s.get('change_pct')
+                    leader = s.get('leader', '')
+                    item = f"{name}"
+                    if chg is not None:
+                        item += f"({chg:+.2f}%)"
+                    if leader and leader != 'None':
+                        item += f" · {leader}"
+                    top_list.append(item)
+
+                bottom_list = []
+                for s in (overview.bottom_sectors or [])[:3]:
+                    name = s.get('name', '')
+                    chg = s.get('change_pct')
+                    item = f"{name}"
+                    if chg is not None:
+                        item += f"({chg:+.2f}%)"
+                    bottom_list.append(item)
+
+                sector_text = f"**🔥 领涨板块**\n{'、'.join(top_list)}"
+                if bottom_list:
+                    sector_text += f"\n\n**❄️ 领跌板块**\n{'、'.join(bottom_list)}"
+
+                elements.append({
+                    "tag": "div",
+                    "text": {"tag": "lark_md", "content": sector_text}
+                })
+                elements.append({"tag": "hr"})
+
+            # --- 5. AI 分析内容（解析 Markdown 分段展示）---
+            if ai_analysis:
+                # 清理可能的 JSON 格式
+                clean_analysis = ai_analysis.strip()
+                if clean_analysis.startswith('{') or clean_analysis.startswith('['):
+                    # 如果是 JSON，尝试提取文本
+                    try:
+                        data = json.loads(clean_analysis)
+                        if isinstance(data, dict):
+                            clean_analysis = data.get('content', data.get('text', str(data)))
+                        elif isinstance(data, list):
+                            clean_analysis = '\n'.join(str(item) for item in data)
+                    except json.JSONDecodeError:
+                        pass  # 不是有效 JSON，保持原样
+
+                # 按 Markdown 标题分段
+                sections = re.split(r'\n(?=#{1,3}\s)', clean_analysis)
+
+                for section in sections:
+                    section = section.strip()
+                    if not section:
+                        continue
+
+                    # 转换 Markdown 标题为加粗文本（飞书 lark_md 不支持 #）
+                    section = re.sub(r'^#{1,3}\s+', '**', section)
+                    if section.startswith('**') and '\n' in section:
+                        first_line_end = section.index('\n')
+                        section = section[:first_line_end] + '**' + section[first_line_end:]
+                    elif section.startswith('**') and '**' not in section[2:]:
+                        section = section + '**'
+
+                    # 限制单段长度（飞书单元素限制）
+                    if len(section) > 2000:
+                        section = section[:1997] + "..."
+
+                    elements.append({
+                        "tag": "div",
+                        "text": {"tag": "lark_md", "content": section}
+                    })
+
+            # --- 6. 底部备注 ---
+            elements.append({
+                "tag": "note",
+                "elements": [{
+                    "tag": "plain_text",
+                    "content": f"📅 {report_date} | 数据来源：AkShare | AI 分析仅供参考"
+                }]
+            })
+
+            # ========== 构建完整卡片 ==========
+            card_payload = {
+                "msg_type": "interactive",
+                "card": {
+                    "config": {"wide_screen_mode": True},
+                    "header": {
+                        "title": {
+                            "tag": "plain_text",
+                            "content": f"{market_emoji} {report_date} 大盘复盘"
+                        },
+                        "template": header_color
+                    },
+                    "elements": elements
+                }
+            }
+
+            # 发送卡片
+            response = requests.post(
+                self._feishu_url,
+                json=card_payload,
+                timeout=30
+            )
+
+            if response.status_code == 200:
+                result = response.json()
+                code = result.get('code') if 'code' in result else result.get('StatusCode')
+                if code == 0:
+                    logger.info("飞书大盘复盘卡片发送成功")
+                    return True
+                else:
+                    error_msg = result.get('msg') or result.get('StatusMessage', '未知错误')
+                    logger.error(f"飞书返回错误: {error_msg}")
+                    # 回退到普通文本发送
+                    return self.send_to_feishu(f"🎯 {report_date} 大盘复盘\n\n{ai_analysis}")
+            else:
+                logger.error(f"飞书请求失败: HTTP {response.status_code}")
+                return self.send_to_feishu(f"🎯 {report_date} 大盘复盘\n\n{ai_analysis}")
+
+        except Exception as e:
+            logger.error(f"发送飞书大盘复盘失败: {e}")
+            # 回退到普通发送
+            return self.send_to_feishu(f"🎯 {report_date} 大盘复盘\n\n{ai_analysis}")
+
     def _send_feishu_chunked(self, content: str, max_bytes: int) -> bool:
         """
         分批发送长消息到飞书
