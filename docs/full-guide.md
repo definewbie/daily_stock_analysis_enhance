@@ -15,6 +15,8 @@
 - [数据源配置](#数据源配置)
 - [高级功能](#高级功能)
 - [本地 WebUI 管理界面](#本地-webui-管理界面)
+- [项目架构](#项目架构)
+- [开发与测试](#开发与测试)
 
 ---
 
@@ -354,22 +356,61 @@ PUSHOVER_API_TOKEN=your_api_token
 
 ## 数据源配置
 
-系统默认使用 AkShare（免费），也支持其他数据源：
+系统采用多数据源策略，自动 fallback 确保数据获取稳定性。
 
-### AkShare（默认）
+### 数据源优先级
+
+#### 实时行情数据
+| 优先级 | 数据源 | 说明 |
+|:------:|--------|------|
+| 1 | **腾讯财经** | 最稳定，无需认证，数据字段完整 |
+| 2 | 东方财富 (EM) | 字段最全（量比、换手率、PE、PB等） |
+| 3 | 新浪财经 | 稳定性较好，字段较少 |
+
+#### 历史K线数据
+| 优先级 | 数据源 | 说明 |
+|:------:|--------|------|
+| 1 | EfinanceFetcher | efinance 库，需安装 |
+| 2 | AkshareFetcher | akshare 库，免费无需配置 |
+| 3 | TushareFetcher | 需要 Token |
+| 4 | BaostockFetcher | 免费，作为备用 |
+| 5 | YfinanceFetcher | 支持美股/港股 |
+
+#### 大盘指数数据
+| 优先级 | 数据源 | 说明 |
+|:------:|--------|------|
+| 1 | **腾讯财经** | 最稳定，直接获取6大指数 |
+| 2 | 新浪财经 | 批量接口 |
+| 3 | 东方财富 | 批量接口 |
+
+#### 市场涨跌统计
+| 优先级 | 数据源 | 说明 |
+|:------:|--------|------|
+| 1 | **EM 概览 API** | 直接返回统计结果，效率最高 |
+| 2 | 新浪/EM 批量 | 获取全量数据后计算 |
+
+### 各数据源配置
+
+#### AkShare（默认）
 - 免费，无需配置
 - 数据来源：东方财富爬虫
+- 已内置防封禁策略（随机休眠、UA轮换、指数退避）
 
-### Tushare Pro
+#### 腾讯财经（自动启用）
+- 免费，无需配置
+- 最稳定的实时行情数据源
+- API 地址：`qt.gtimg.cn`
+
+#### Tushare Pro
 - 需要注册获取 Token
 - 更稳定，数据更全
 - 设置 `TUSHARE_TOKEN`
 
-### Baostock
+#### Baostock
 - 免费，无需配置
 - 作为备用数据源
 
-### YFinance
+#### YFinance
 - 免费，无需配置
 - 支持美股/港股数据
 
@@ -444,19 +485,193 @@ WEBUI_PORT=8888       # 默认 8000
 
 ---
 
+## 项目架构
+
+### 目录结构
+
+```
+daily_stock_analysis/
+├── main.py                 # 入口文件，流程调度
+├── config.py               # 配置管理
+├── analyzer.py             # AI 分析器（Gemini/OpenAI）
+├── analyzer_models.py      # 分析结果数据模型
+├── market_analyzer.py      # 大盘复盘分析
+├── market_models.py        # 市场数据模型
+├── market_utils.py         # 市场分析工具函数
+├── stock_analyzer.py       # 技术面分析（均线、支撑位等）
+├── notification.py         # 通知发送服务
+├── notification_channels.py # 通知渠道定义
+├── storage.py              # 数据库存储（SQLite）
+├── search_service.py       # 新闻搜索服务
+├── scheduler.py            # 定时任务调度
+├── webui.py                # Web 管理界面
+├── data_provider/          # 数据获取层
+│   ├── __init__.py
+│   ├── base.py             # 基类和管理器
+│   ├── models.py           # 数据模型（RealtimeQuote等）
+│   ├── utils.py            # 工具函数
+│   ├── akshare_fetcher.py  # AkShare 数据源
+│   ├── efinance_fetcher.py # Efinance 数据源
+│   ├── tushare_fetcher.py  # Tushare 数据源
+│   ├── baostock_fetcher.py # Baostock 数据源
+│   └── yfinance_fetcher.py # YFinance 数据源
+├── tests/                  # 单元测试
+│   ├── test_data_provider.py
+│   └── test_market_utils.py
+├── reports/                # 生成的报告
+├── logs/                   # 日志文件
+└── data/                   # SQLite 数据库
+```
+
+### 核心模块说明
+
+| 模块 | 职责 |
+|------|------|
+| `main.py` | 入口和流程调度，支持多线程并发分析 |
+| `analyzer.py` | AI 分析，支持 Gemini（主）和 OpenAI 兼容 API（备） |
+| `market_analyzer.py` | 大盘复盘，获取指数、板块、资金流向等 |
+| `stock_analyzer.py` | 技术面分析，计算均线、乖离率、支撑压力位 |
+| `notification.py` | 多渠道推送，自动分段发送长消息 |
+| `data_provider/` | 策略模式管理多数据源，自动 fallback |
+
+### 数据流程
+
+```
+main.py
+  ↓
+DataFetcherManager (data_provider/)
+  ↓ 腾讯/EM/新浪/AkShare fallback
+获取历史K线 + 实时行情
+  ↓
+StockTrendAnalyzer (stock_analyzer.py)
+  ↓ 计算均线、乖离率、支撑压力位
+SearchService (search_service.py)
+  ↓ Tavily/Bocha/SerpAPI 搜索新闻
+GeminiAnalyzer (analyzer.py)
+  ↓ AI 生成分析报告
+NotificationService (notification.py)
+  ↓ 飞书/微信/Telegram/邮件推送
+Storage (storage.py)
+  ↓ 保存到 SQLite
+```
+
+---
+
+## 开发与测试
+
+### 环境准备
+
+```bash
+# 克隆仓库
+git clone https://github.com/ZhuLinsen/daily_stock_analysis.git
+cd daily_stock_analysis
+
+# 创建虚拟环境
+python -m venv .venv
+source .venv/bin/activate  # Linux/Mac
+# .venv\Scripts\activate   # Windows
+
+# 安装依赖
+pip install -r requirements.txt
+
+# 安装开发依赖
+pip install pytest black isort flake8
+```
+
+### 运行测试
+
+```bash
+# 运行所有测试（排除需要网络的测试）
+python -m pytest tests/ -v -m "not network"
+
+# 运行包括网络测试
+python -m pytest tests/ -v
+
+# 运行特定测试文件
+python -m pytest tests/test_data_provider.py -v
+
+# 运行特定测试类
+python -m pytest tests/test_data_provider.py::TestRealtimeQuote -v
+```
+
+### 测试覆盖
+
+| 测试文件 | 覆盖内容 |
+|----------|----------|
+| `test_data_provider.py` | 数据模型、工具函数、API 获取 |
+| `test_market_utils.py` | 中文数字解析、板块格式化、市场数据模型 |
+
+### 代码风格
+
+```bash
+# 格式化代码
+black .
+
+# 排序 import
+isort .
+
+# 检查语法错误
+flake8 . --select=E9,F63,F7,F82
+```
+
+### 测试配置
+
+```bash
+# 测试环境配置
+python test_env.py              # 完整测试
+python test_env.py --llm        # 测试 AI 模型
+python test_env.py --fetch      # 测试数据获取
+python test_env.py --notify     # 测试通知推送
+python test_env.py --db         # 查看数据库
+```
+
+### 添加新数据源
+
+1. 在 `data_provider/` 创建新的 fetcher 文件
+2. 继承 `BaseFetcher` 类
+3. 实现 `get_daily_data()` 和 `get_realtime_quote()` 方法
+4. 在 `data_provider/__init__.py` 注册
+
+示例：
+
+```python
+# data_provider/my_fetcher.py
+from .base import BaseFetcher
+
+class MyFetcher(BaseFetcher):
+    name = "MyFetcher"
+    priority = 5  # 优先级，数字越小越优先
+
+    def get_daily_data(self, stock_code, start_date, end_date):
+        # 返回 DataFrame，包含标准列
+        pass
+
+    def get_realtime_quote(self, stock_code):
+        # 返回 RealtimeQuote 对象
+        pass
+```
+
+---
+
 ## 常见问题
 
 ### Q: 推送消息被截断？
 A: 企业微信/飞书有消息长度限制，系统已自动分段发送。如需完整内容，可配置飞书云文档功能。
 
 ### Q: 数据获取失败？
-A: AkShare 使用爬虫机制，可能被临时限流。系统已配置重试机制，一般等待几分钟后重试即可。
+A: 系统已配置多数据源自动 fallback。如果所有源都失败，可能是网络问题或被临时限流，等待几分钟后重试即可。
 
 ### Q: 如何添加自选股？
 A: 修改 `STOCK_LIST` 环境变量，多个代码用逗号分隔。
 
 ### Q: GitHub Actions 没有执行？
 A: 检查是否启用了 Actions，以及 cron 表达式是否正确（注意是 UTC 时间）。
+
+### Q: 如何运行单元测试？
+A: 安装 pytest 后运行 `python -m pytest tests/ -v`。
+
+### Q: 腾讯 API 是什么？
+A: 腾讯财经的股票数据接口 (`qt.gtimg.cn`)，无需认证，稳定性最好，已作为实时行情的首选数据源。
 
 ---
 

@@ -18,6 +18,8 @@
 """
 
 from .base import BaseFetcher, DataFetcherManager
+from .models import RealtimeQuote, ChipDistribution
+from .utils import is_etf_code, is_hk_code, USER_AGENTS
 from .efinance_fetcher import EfinanceFetcher
 from .akshare_fetcher import AkshareFetcher
 from .tushare_fetcher import TushareFetcher
@@ -27,6 +29,11 @@ from .yfinance_fetcher import YfinanceFetcher
 __all__ = [
     'BaseFetcher',
     'DataFetcherManager',
+    'RealtimeQuote',
+    'ChipDistribution',
+    'is_etf_code',
+    'is_hk_code',
+    'USER_AGENTS',
     'EfinanceFetcher',
     'AkshareFetcher',
     'TushareFetcher',

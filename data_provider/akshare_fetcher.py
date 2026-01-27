@@ -21,7 +21,6 @@ AkshareFetcher - 主数据源 (Priority 1)
 import logging
 import random
 import time
-from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional, Dict, Any
 
@@ -35,207 +34,20 @@ from tenacity import (
 )
 
 from .base import BaseFetcher, DataFetchError, RateLimitError, STANDARD_COLUMNS
+from .models import RealtimeQuote, ChipDistribution
+from .utils import (
+    USER_AGENTS,
+    is_etf_code,
+    is_hk_code,
+    get_realtime_cache,
+    get_etf_realtime_cache,
+)
 
-
-@dataclass
-class RealtimeQuote:
-    """
-    实时行情数据
-    
-    包含当日实时交易数据和估值指标
-    """
-    code: str
-    name: str = ""
-    price: float = 0.0           # 最新价
-    change_pct: float = 0.0      # 涨跌幅(%)
-    change_amount: float = 0.0   # 涨跌额
-    
-    # 量价指标
-    volume_ratio: float = 0.0    # 量比（当前成交量/过去5日平均成交量）
-    turnover_rate: float = 0.0   # 换手率(%)
-    amplitude: float = 0.0       # 振幅(%)
-    
-    # 估值指标
-    pe_ratio: float = 0.0        # 市盈率(动态)
-    pb_ratio: float = 0.0        # 市净率
-    total_mv: float = 0.0        # 总市值(元)
-    circ_mv: float = 0.0         # 流通市值(元)
-    
-    # 其他
-    change_60d: float = 0.0      # 60日涨跌幅(%)
-    high_52w: float = 0.0        # 52周最高
-    low_52w: float = 0.0         # 52周最低
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """转换为字典"""
-        return {
-            'code': self.code,
-            'name': self.name,
-            'price': self.price,
-            'change_pct': self.change_pct,
-            'volume_ratio': self.volume_ratio,
-            'turnover_rate': self.turnover_rate,
-            'amplitude': self.amplitude,
-            'pe_ratio': self.pe_ratio,
-            'pb_ratio': self.pb_ratio,
-            'total_mv': self.total_mv,
-            'circ_mv': self.circ_mv,
-            'change_60d': self.change_60d,
-        }
-
-
-@dataclass  
-class ChipDistribution:
-    """
-    筹码分布数据
-    
-    反映持仓成本分布和获利情况
-    """
-    code: str
-    date: str = ""
-    
-    # 获利情况
-    profit_ratio: float = 0.0     # 获利比例(0-1)
-    avg_cost: float = 0.0         # 平均成本
-    
-    # 筹码集中度
-    cost_90_low: float = 0.0      # 90%筹码成本下限
-    cost_90_high: float = 0.0     # 90%筹码成本上限
-    concentration_90: float = 0.0  # 90%筹码集中度（越小越集中）
-    
-    cost_70_low: float = 0.0      # 70%筹码成本下限
-    cost_70_high: float = 0.0     # 70%筹码成本上限
-    concentration_70: float = 0.0  # 70%筹码集中度
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """转换为字典"""
-        return {
-            'code': self.code,
-            'date': self.date,
-            'profit_ratio': self.profit_ratio,
-            'avg_cost': self.avg_cost,
-            'cost_90_low': self.cost_90_low,
-            'cost_90_high': self.cost_90_high,
-            'concentration_90': self.concentration_90,
-            'concentration_70': self.concentration_70,
-        }
-    
-    def get_chip_status(self, current_price: float) -> str:
-        """
-        获取筹码状态描述
-        
-        Args:
-            current_price: 当前股价
-            
-        Returns:
-            筹码状态描述
-        """
-        status_parts = []
-        
-        # 获利比例分析
-        if self.profit_ratio >= 0.9:
-            status_parts.append("获利盘极高(>90%)")
-        elif self.profit_ratio >= 0.7:
-            status_parts.append("获利盘较高(70-90%)")
-        elif self.profit_ratio >= 0.5:
-            status_parts.append("获利盘中等(50-70%)")
-        elif self.profit_ratio >= 0.3:
-            status_parts.append("套牢盘较多(>30%)")
-        else:
-            status_parts.append("套牢盘极重(>70%)")
-        
-        # 筹码集中度分析 (90%集中度 < 10% 表示集中)
-        if self.concentration_90 < 0.08:
-            status_parts.append("筹码高度集中")
-        elif self.concentration_90 < 0.15:
-            status_parts.append("筹码较集中")
-        elif self.concentration_90 < 0.25:
-            status_parts.append("筹码分散度中等")
-        else:
-            status_parts.append("筹码较分散")
-        
-        # 成本与现价关系
-        if current_price > 0 and self.avg_cost > 0:
-            cost_diff = (current_price - self.avg_cost) / self.avg_cost * 100
-            if cost_diff > 20:
-                status_parts.append(f"现价高于平均成本{cost_diff:.1f}%")
-            elif cost_diff > 5:
-                status_parts.append(f"现价略高于成本{cost_diff:.1f}%")
-            elif cost_diff > -5:
-                status_parts.append("现价接近平均成本")
-            else:
-                status_parts.append(f"现价低于平均成本{abs(cost_diff):.1f}%")
-        
-        return "，".join(status_parts)
+# 获取模块级别的缓存引用
+_realtime_cache = get_realtime_cache()
+_etf_realtime_cache = get_etf_realtime_cache()
 
 logger = logging.getLogger(__name__)
-
-
-# User-Agent 池，用于随机轮换
-USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-]
-
-
-# 缓存实时行情数据（避免重复请求）
-_realtime_cache: Dict[str, Any] = {
-    'data': None,
-    'timestamp': 0,
-    'ttl': 60  # 60秒缓存有效期
-}
-
-# ETF 实时行情缓存
-_etf_realtime_cache: Dict[str, Any] = {
-    'data': None,
-    'timestamp': 0,
-    'ttl': 60  # 60秒缓存有效期
-}
-
-
-def _is_etf_code(stock_code: str) -> bool:
-    """
-    判断代码是否为 ETF 基金
-    
-    ETF 代码规则：
-    - 上交所 ETF: 51xxxx, 52xxxx, 56xxxx, 58xxxx
-    - 深交所 ETF: 15xxxx, 16xxxx, 18xxxx
-    
-    Args:
-        stock_code: 股票/基金代码
-        
-    Returns:
-        True 表示是 ETF 代码，False 表示是普通股票代码
-    """
-    etf_prefixes = ('51', '52', '56', '58', '15', '16', '18')
-    return stock_code.startswith(etf_prefixes) and len(stock_code) == 6
-
-
-def _is_hk_code(stock_code: str) -> bool:
-    """
-    判断代码是否为港股
-    
-    港股代码规则：
-    - 5位数字代码，如 '00700' (腾讯控股)
-    - 部分港股代码可能带有前缀，如 'hk00700', 'hk1810'
-    
-    Args:
-        stock_code: 股票代码
-        
-    Returns:
-        True 表示是港股代码，False 表示不是港股代码
-    """
-    # 去除可能的 'hk' 前缀并检查是否为纯数字
-    code = stock_code.lower()
-    if code.startswith('hk'):
-        # 带 hk 前缀的一定是港股，去掉前缀后应为纯数字（1-5位）
-        numeric_part = code[2:]
-        return numeric_part.isdigit() and 1 <= len(numeric_part) <= 5
-    # 无前缀时，5位纯数字才视为港股（避免误判 A 股代码）
-    return code.isdigit() and len(code) == 5
 
 
 class AkshareFetcher(BaseFetcher):
@@ -325,9 +137,9 @@ class AkshareFetcher(BaseFetcher):
         5. 处理返回数据
         """
         # 根据代码类型选择不同的获取方法
-        if _is_hk_code(stock_code):
+        if is_hk_code(stock_code):
             return self._fetch_hk_data(stock_code, start_date, end_date)
-        elif _is_etf_code(stock_code):
+        elif is_etf_code(stock_code):
             return self._fetch_etf_data(stock_code, start_date, end_date)
         else:
             return self._fetch_stock_data(stock_code, start_date, end_date)
@@ -564,9 +376,9 @@ class AkshareFetcher(BaseFetcher):
             RealtimeQuote 对象，获取失败返回 None
         """
         # 根据代码类型选择不同的获取方法
-        if _is_hk_code(stock_code):
+        if is_hk_code(stock_code):
             return self._get_hk_realtime_quote(stock_code)
-        elif _is_etf_code(stock_code):
+        elif is_etf_code(stock_code):
             return self._get_etf_realtime_quote(stock_code)
         else:
             return self._get_stock_realtime_quote(stock_code)
@@ -575,9 +387,10 @@ class AkshareFetcher(BaseFetcher):
         """
         获取普通 A 股实时行情数据
 
-        数据来源优先级：
-        1. ak.stock_zh_a_spot_em() - EM接口，字段最全（量比、换手率、PE、PB、市值等）
-        2. ak.stock_zh_a_spot() - 新浪接口，字段较少但更稳定（fallback）
+        数据来源优先级（按稳定性排序）：
+        1. 腾讯单股接口 - 最稳定，无需认证，数据较全
+        2. ak.stock_zh_a_spot_em() - EM批量接口，字段最全（量比、换手率、PE、PB、市值等）
+        3. ak.stock_zh_a_spot() - 新浪批量接口，字段较少但稳定
         """
         import akshare as ak
 
@@ -591,6 +404,14 @@ class AkshareFetcher(BaseFetcher):
                 return default
 
         try:
+            # ==== 优先使用腾讯单股接口（最稳定） ====
+            tencent_quote = self._get_realtime_from_tencent(stock_code)
+            if tencent_quote:
+                return tencent_quote
+
+            logger.warning(f"[实时行情] 腾讯接口失败，尝试批量接口获取 {stock_code}")
+
+            # ==== 腾讯失败时，尝试批量接口（可利用缓存） ====
             # 检查缓存
             current_time = time.time()
             if (_realtime_cache['data'] is not None and
@@ -644,7 +465,7 @@ class AkshareFetcher(BaseFetcher):
 
                 # 更新缓存
                 if df is None or df.empty:
-                    logger.error(f"[API错误] 所有数据源获取A股实时行情失败: {last_error}")
+                    logger.error(f"[API错误] 所有批量数据源获取A股实时行情失败: {last_error}")
                     df = pd.DataFrame()
                     source = None
 
@@ -652,17 +473,16 @@ class AkshareFetcher(BaseFetcher):
                 _realtime_cache['timestamp'] = current_time
                 _realtime_cache['source'] = source
 
-            # 如果批量接口都失败，尝试雪球单股接口
+            # 如果批量接口都失败，返回None
             if df is None or df.empty:
-                logger.warning(f"[实时行情] 批量接口失败，尝试雪球单股接口获取 {stock_code}")
-                return self._get_realtime_from_xueqiu(stock_code)
+                logger.error(f"[实时行情] 所有数据源均失败，无法获取 {stock_code} 行情")
+                return None
 
             # 查找指定股票
             row = df[df['代码'] == stock_code]
             if row.empty:
-                # 批量数据中没有该股票，尝试雪球单股接口
-                logger.warning(f"[API返回] 批量数据中未找到 {stock_code}，尝试雪球单股接口")
-                return self._get_realtime_from_xueqiu(stock_code)
+                logger.warning(f"[API返回] 批量数据中未找到 {stock_code}")
+                return None
 
             row = row.iloc[0]
 
@@ -803,14 +623,14 @@ class AkshareFetcher(BaseFetcher):
             logger.warning(f"[雪球补充] {stock_code} 获取失败: {e}")
             return None
 
-    def _get_realtime_from_xueqiu(self, stock_code: str) -> Optional[RealtimeQuote]:
+    def _get_realtime_from_tencent(self, stock_code: str) -> Optional[RealtimeQuote]:
         """
-        从腾讯财经 API 获取单股实时行情（当批量接口失败时的备选方案）
+        从腾讯财经 API 获取单股实时行情（首选方案，最稳定）
 
-        注意：由于雪球 API 需要动态 token，改用腾讯财经 API 作为备选
         腾讯 API 优点：
         - 无需认证，稳定可靠
         - 数据字段完整（换手率、PE、PB、市值、振幅等）
+        - 响应速度快
 
         Args:
             stock_code: 股票代码（纯数字，如 000001）
@@ -1093,7 +913,7 @@ class AkshareFetcher(BaseFetcher):
         import akshare as ak
         
         # ETF/指数没有筹码分布数据
-        if _is_etf_code(stock_code):
+        if is_etf_code(stock_code):
             logger.debug(f"[API跳过] {stock_code} 是 ETF/指数，无筹码分布数据")
             return None
         
