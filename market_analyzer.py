@@ -33,6 +33,7 @@ import requests
 from config import get_config
 from search_service import SearchService
 from market_models import MarketIndex, MarketOverview
+from storage import get_db, MarketDaily, SectorDaily
 from market_utils import (
     parse_cn_unit_number as _parse_cn_unit_number,
     safe_float as _safe_float,
@@ -108,8 +109,11 @@ class MarketAnalyzer:
         # 3. 获取板块涨跌榜
         self._get_sector_rankings(overview)
 
-        # 4. 获取北向资金（可选）
-        # self._get_north_flow(overview)
+        # 4. 获取北向资金
+        self._get_north_flow(overview)
+
+        # 5. 保存数据到数据库
+        self._save_to_database(overview)
 
         return overview
 
@@ -700,6 +704,250 @@ class MarketAnalyzer:
 
         overview.top_sectors = [row_to_dict(r) for _, r in top.iterrows()]
         overview.bottom_sectors = [row_to_dict(r) for _, r in bottom.iterrows()]
+        # 保存板块源信息用于存储
+        overview._sector_source = source
+
+    def _get_north_flow(self, overview: MarketOverview):
+        """
+        获取北向资金净流入数据
+
+        使用东方财富接口获取沪深港通资金流向汇总
+        """
+        logger.info("[大盘] 获取北向资金数据...")
+
+        try:
+            # 获取北向资金汇总数据
+            df = self._call_akshare_with_retry(
+                lambda: ak.stock_hsgt_fund_flow_summary_em(),
+                "北向资金汇总"
+            )
+
+            if df is None or df.empty:
+                logger.warning("[大盘] 北向资金数据为空")
+                return
+
+            # 东财接口返回格式（2026年新版）：
+            # 列名: ['交易日', '类型', '板块', '资金方向', '交易状态', '成交净买额',
+            #        '资金净流入', '当日资金余额', '上涨数', '持平数', '下跌数', '相关指数', '指数涨跌幅']
+            # 北向资金 = 沪股通(北向) + 深股通(北向) 的资金净流入
+
+            total = 0.0
+
+            # 新版接口：通过 '板块' 和 '资金方向' 列筛选
+            if '板块' in df.columns and '资金方向' in df.columns:
+                # 筛选北向资金（沪股通+深股通）
+                north_df = df[(df['资金方向'] == '北向')]
+
+                if not north_df.empty:
+                    # 取资金净流入列
+                    flow_col = '资金净流入' if '资金净流入' in df.columns else '成交净买额'
+                    if flow_col in df.columns:
+                        total = north_df[flow_col].sum()
+                        overview.north_flow = _safe_float(total, 0.0)
+                        # 获取数据日期
+                        data_date = north_df['交易日'].iloc[0] if '交易日' in north_df.columns else '未知'
+                        logger.info(f"[大盘] 北向资金({data_date}): {overview.north_flow:+.2f} 亿元")
+                        return
+
+            # 旧版接口兼容：通过 '名称' 列筛选
+            if '名称' in df.columns:
+                # 筛选"北向资金"行
+                north_row = df[df['名称'].str.contains('北向', na=False)]
+                if not north_row.empty:
+                    for col in ['今日', '当日净流入', '净流入', '资金净流入']:
+                        if col in df.columns:
+                            val = north_row[col].iloc[0]
+                            overview.north_flow = _safe_float(val, 0.0)
+                            logger.info(f"[大盘] 北向资金: {overview.north_flow:+.2f} 亿元")
+                            return
+
+                # 备选：直接取沪股通+深股通
+                hgt_row = df[df['名称'].str.contains('沪股通', na=False)]
+                sgt_row = df[df['名称'].str.contains('深股通', na=False)]
+
+                for col in ['今日', '当日净流入', '净流入', '资金净流入']:
+                    if col in df.columns:
+                        if not hgt_row.empty:
+                            total += _safe_float(hgt_row[col].iloc[0], 0.0)
+                        if not sgt_row.empty:
+                            total += _safe_float(sgt_row[col].iloc[0], 0.0)
+                        if total != 0.0:
+                            overview.north_flow = total
+                            logger.info(f"[大盘] 北向资金(沪+深): {overview.north_flow:+.2f} 亿元")
+                            return
+
+            logger.warning(f"[大盘] 北向资金字段解析失败，可用列: {df.columns.tolist()}")
+
+        except Exception as e:
+            logger.error(f"[大盘] 获取北向资金失败: {e}")
+
+    def _get_sh_index_ma60(self) -> tuple:
+        """
+        获取上证指数的MA60数据
+
+        Returns:
+            (sh_ma60, sh_close_20d_ago, market_state)
+        """
+        try:
+            logger.info("[大盘] 获取上证指数MA60数据...")
+
+            # 使用 akshare 获取上证指数日线数据
+            df = self._call_akshare_with_retry(
+                lambda: ak.stock_zh_index_daily(symbol="sh000001"),
+                "上证指数日线"
+            )
+
+            if df is None or df.empty:
+                logger.warning("[大盘] 上证指数日线数据为空")
+                return None, None, 'neutral'
+
+            # 按日期排序（确保最新在最后）
+            if 'date' in df.columns:
+                df = df.sort_values('date')
+            elif '日期' in df.columns:
+                df = df.sort_values('日期')
+
+            # 获取收盘价列
+            close_col = 'close' if 'close' in df.columns else '收盘'
+            if close_col not in df.columns:
+                logger.warning(f"[大盘] 未找到收盘价列，可用列: {df.columns.tolist()}")
+                return None, None, 'neutral'
+
+            # 计算MA60
+            df['ma60'] = df[close_col].rolling(window=60).mean()
+
+            # 获取最新数据
+            latest = df.iloc[-1]
+            sh_close = float(latest[close_col])
+            sh_ma60 = float(latest['ma60']) if pd.notna(latest['ma60']) else None
+
+            # 获取20日前数据
+            sh_close_20d_ago = None
+            if len(df) >= 20:
+                sh_close_20d_ago = float(df.iloc[-20][close_col])
+
+            # 判断市场状态
+            market_state = 'neutral'
+            if sh_ma60 and sh_close_20d_ago:
+                above_ma60 = sh_close > sh_ma60
+                change_20d = (sh_close - sh_close_20d_ago) / sh_close_20d_ago * 100
+
+                if above_ma60 and change_20d > 5:
+                    market_state = 'bull'
+                elif not above_ma60 and change_20d < -5:
+                    market_state = 'bear'
+
+            logger.info(f"[大盘] 上证MA60: {sh_ma60:.2f}, 20日前: {sh_close_20d_ago:.2f}, 状态: {market_state}")
+            return sh_ma60, sh_close_20d_ago, market_state
+
+        except Exception as e:
+            logger.error(f"[大盘] 获取上证MA60失败: {e}")
+            return None, None, 'neutral'
+
+    def _save_to_database(self, overview: MarketOverview):
+        """
+        保存市场数据和板块数据到数据库
+
+        Args:
+            overview: 市场概览数据
+        """
+        try:
+            db = get_db()
+            target_date = datetime.strptime(overview.date, '%Y-%m-%d').date()
+
+            # 1. 保存市场每日数据
+            # 从指数数据中提取主要指数收盘价
+            sh_data = next((i for i in overview.indices if '上证指数' in i.name), None)
+            sz_data = next((i for i in overview.indices if '深证成指' in i.name), None)
+            cyb_data = next((i for i in overview.indices if '创业板指' in i.name), None)
+
+            # 获取上证MA60数据
+            sh_ma60, sh_close_20d_ago, market_state = self._get_sh_index_ma60()
+
+            market_data = {
+                'date': overview.date,
+                'up_count': overview.up_count,
+                'down_count': overview.down_count,
+                'flat_count': overview.flat_count,
+                'limit_up_count': overview.limit_up_count,
+                'limit_down_count': overview.limit_down_count,
+                'total_amount': overview.total_amount,
+                'north_flow': overview.north_flow,
+                'sh_index': sh_data.current if sh_data else None,
+                'sh_change_pct': sh_data.change_pct if sh_data else None,
+                'sz_index': sz_data.current if sz_data else None,
+                'sz_change_pct': sz_data.change_pct if sz_data else None,
+                'cyb_index': cyb_data.current if cyb_data else None,
+                'cyb_change_pct': cyb_data.change_pct if cyb_data else None,
+                'sh_ma60': sh_ma60,
+                'sh_close_20d_ago': sh_close_20d_ago,
+                'market_state': market_state,
+            }
+            db.save_market_daily(market_data)
+
+            # 2. 保存板块每日数据
+            source = getattr(overview, '_sector_source', 'unknown')
+            if overview.top_sectors:
+                db.save_sector_daily(
+                    overview.top_sectors,
+                    target_date,
+                    rank_type='top',
+                    source=source
+                )
+            if overview.bottom_sectors:
+                db.save_sector_daily(
+                    overview.bottom_sectors,
+                    target_date,
+                    rank_type='bottom',
+                    source=source
+                )
+
+            logger.info("[大盘] 市场数据已保存到数据库")
+
+        except Exception as e:
+            logger.error(f"[大盘] 保存市场数据到数据库失败: {e}")
+
+    def _get_history_context(self) -> Dict[str, Any]:
+        """
+        获取历史数据上下文，用于AI分析对比
+
+        Returns:
+            包含历史数据的字典
+        """
+        try:
+            db = get_db()
+            history = db.get_market_history(days=5)
+
+            if len(history) < 2:
+                return {}
+
+            # 昨日数据（最近的历史记录）
+            yesterday = history[0]
+            context = {
+                'has_history': True,
+                'yesterday_date': yesterday.date.isoformat() if yesterday.date else None,
+                'yesterday_amount': yesterday.total_amount,
+                'yesterday_north_flow': yesterday.north_flow,
+                'yesterday_up_count': yesterday.up_count,
+                'yesterday_down_count': yesterday.down_count,
+                'yesterday_sh_change_pct': yesterday.sh_change_pct,
+            }
+
+            # 近5日平均成交额
+            amounts = [h.total_amount for h in history if h.total_amount]
+            if amounts:
+                context['avg_5d_amount'] = sum(amounts) / len(amounts)
+
+            # 近5日北向资金累计
+            north_flows = [h.north_flow for h in history if h.north_flow is not None]
+            if north_flows:
+                context['sum_5d_north_flow'] = sum(north_flows)
+
+            return context
+
+        except Exception as e:
+            logger.error(f"[大盘] 获取历史数据失败: {e}")
+            return {}
 
     def search_market_news(self) -> List[Dict]:
         """
@@ -818,9 +1066,42 @@ class MarketAnalyzer:
                 snippet = n.get('snippet', '')[:100]
             news_text += f"{i}. {title}\n   {snippet}\n"
 
+        # 获取历史数据对比
+        history = self._get_history_context()
+        history_text = ""
+        if history.get('has_history'):
+            yesterday_amt = history.get('yesterday_amount', 0) or 0
+            today_amt = overview.total_amount or 0
+            amt_change = today_amt - yesterday_amt
+            amt_change_pct = (amt_change / yesterday_amt * 100) if yesterday_amt > 0 else 0
+
+            yesterday_north = history.get('yesterday_north_flow', 0) or 0
+            avg_5d_amt = history.get('avg_5d_amount', 0) or 0
+            sum_5d_north = history.get('sum_5d_north_flow', 0) or 0
+
+            history_text = f"""
+## 历史对比（请严格基于此数据进行对比分析）
+- 前一交易日({history.get('yesterday_date', 'N/A')})成交额: {yesterday_amt:.0f} 亿元
+- 今日成交额变化: {amt_change:+.0f} 亿元 ({amt_change_pct:+.1f}%)
+- 近5日平均成交额: {avg_5d_amt:.0f} 亿元
+- 前一交易日北向资金: {yesterday_north:+.2f} 亿元
+- 近5日北向资金累计: {sum_5d_north:+.2f} 亿元
+"""
+        else:
+            history_text = """
+## 历史对比
+（首次运行，暂无历史数据。请勿编造"较上个交易日"的对比内容。）
+"""
+
         prompt = f"""你是一位专业的A股市场分析师，请根据以下数据生成一份简洁的大盘复盘报告。
 
-【重要】输出要求：
+【重要】数据准确性要求：
+1. 必须严格使用下方提供的数据，禁止编造或猜测任何数值
+2. 涉及"较上个交易日"、"环比"等对比时，必须使用【历史对比】部分提供的数据
+3. 如果没有历史对比数据，禁止使用"增加"、"减少"、"略有增加"等比较性表述
+4. 北向资金为0时，请说明"北向资金今日暂无数据"，而非编造数值
+
+【重要】输出格式要求：
 - 必须输出纯 Markdown 文本格式
 - 禁止输出 JSON 格式
 - 禁止输出代码块
@@ -841,6 +1122,7 @@ class MarketAnalyzer:
 - 涨停: {overview.limit_up_count} 家 | 跌停: {overview.limit_down_count} 家
 - 两市成交额: {overview.total_amount:.0f} 亿元
 - 北向资金: {overview.north_flow:+.2f} 亿元
+{history_text}
 
 ## 板块表现
 领涨: {top_sectors_text}
@@ -856,13 +1138,13 @@ class MarketAnalyzer:
 ## 📊 {overview.date} 大盘复盘
 
 ### 一、市场总结
-（2-3句话概括今日市场整体表现，包括指数涨跌、成交量变化）
+（2-3句话概括今日市场整体表现，包括指数涨跌、成交量变化。如有历史对比数据，需准确引用变化幅度）
 
 ### 二、指数点评
 （分析上证、深证、创业板等各指数走势特点）
 
 ### 三、资金动向
-（解读成交额和北向资金流向的含义）
+（严格基于提供的数据解读成交额变化和北向资金流向。禁止编造对比数据）
 
 ### 四、热点解读
 （分析领涨领跌板块背后的逻辑和驱动因素）

@@ -107,7 +107,15 @@ class Config:
     schedule_enabled: bool = False            # 是否启用定时任务
     schedule_time: str = "18:00"              # 每日推送时间（HH:MM 格式）
     market_review_enabled: bool = True        # 是否启用大盘复盘
-    
+
+    # === 选股配置 ===
+    stock_picker_enabled: bool = False        # 是否启用选股
+    stock_picker_markets: List[str] = field(default_factory=lambda: ['SH', 'SZ'])  # 关注市场
+    stock_picker_top_n: int = 10              # 每日最多选股数
+    stock_picker_mv_bull: float = 80.0        # 牛市市值阈值(亿)
+    stock_picker_mv_neutral: float = 50.0     # 震荡市值阈值(亿)
+    stock_picker_mv_bear: float = 40.0        # 熊市市值阈值(亿)
+
     # === 流控配置（防封禁关键参数）===
     # Akshare 请求间隔范围（秒）
     akshare_sleep_min: float = 2.0
@@ -219,6 +227,12 @@ class Config:
             schedule_enabled=os.getenv('SCHEDULE_ENABLED', 'false').lower() == 'true',
             schedule_time=os.getenv('SCHEDULE_TIME', '18:00'),
             market_review_enabled=os.getenv('MARKET_REVIEW_ENABLED', 'true').lower() == 'true',
+            stock_picker_enabled=os.getenv('STOCK_PICKER_ENABLED', 'false').lower() == 'true',
+            stock_picker_markets=[m.strip() for m in os.getenv('STOCK_PICKER_MARKETS', 'SH,SZ').split(',')],
+            stock_picker_top_n=int(os.getenv('STOCK_PICKER_TOP_N', '10')),
+            stock_picker_mv_bull=float(os.getenv('STOCK_PICKER_MV_BULL', '80')),
+            stock_picker_mv_neutral=float(os.getenv('STOCK_PICKER_MV_NEUTRAL', '50')),
+            stock_picker_mv_bear=float(os.getenv('STOCK_PICKER_MV_BEAR', '40')),
             webui_enabled=os.getenv('WEBUI_ENABLED', 'false').lower() == 'true',
             webui_host=os.getenv('WEBUI_HOST', '127.0.0.1'),
             webui_port=int(os.getenv('WEBUI_PORT', '8000')),

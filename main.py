@@ -731,7 +731,32 @@ def parse_arguments() -> argparse.Namespace:
         action='store_true',
         help='启动本地配置 WebUI'
     )
-    
+
+    parser.add_argument(
+        '--stock-picker',
+        action='store_true',
+        help='启用选股功能，基于板块和技术指标选股'
+    )
+
+    parser.add_argument(
+        '--policy-analysis',
+        action='store_true',
+        help='执行政策分析（盘前/盘后）'
+    )
+
+    parser.add_argument(
+        '--webui-v2',
+        action='store_true',
+        help='启动新版 Web UI V2（Vue3 + ECharts，选股-复盘-决策流程）'
+    )
+
+    parser.add_argument(
+        '--webui-v2-port',
+        type=int,
+        default=5000,
+        help='Web UI V2 端口（默认 5000）'
+    )
+
     return parser.parse_args()
 
 
@@ -917,7 +942,16 @@ def main() -> int:
     warnings = config.validate()
     for warning in warnings:
         logger.warning(warning)
-    
+
+    # 初始化数据库并清理过期数据（保留30天）
+    try:
+        db = get_db()
+        deleted = db.cleanup_old_data(retention_days=30)
+        if any(deleted.values()):
+            logger.info(f"数据清理完成: {deleted}")
+    except Exception as e:
+        logger.warning(f"数据清理失败: {e}")
+
     # 解析股票列表
     stock_codes = None
     if args.stocks:
@@ -936,6 +970,14 @@ def main() -> int:
             logger.error(f"启动 WebUI 失败: {e}")
 
     try:
+        # 模式0: 启动 Web UI V2
+        if args.webui_v2:
+            logger.info("模式: Web UI V2")
+            logger.info(f"启动 Web UI V2 (端口: {args.webui_v2_port})")
+            from webui_v2 import run_webui_v2
+            run_webui_v2(host='127.0.0.1', port=args.webui_v2_port, debug=args.debug)
+            return 0
+
         # 模式1: 仅大盘复盘
         if args.market_review:
             logger.info("模式: 仅大盘复盘")
@@ -957,7 +999,61 @@ def main() -> int:
             
             run_market_review(notifier, analyzer, search_service)
             return 0
-        
+
+        # 模式1.5: 选股模式
+        if args.stock_picker or config.stock_picker_enabled:
+            logger.info("模式: 选股")
+            from stock_picker import StockPicker
+
+            # 初始化依赖
+            search_service = None
+            analyzer = None
+
+            if config.bocha_api_keys or config.tavily_api_keys or config.serpapi_keys:
+                search_service = SearchService(
+                    bocha_keys=config.bocha_api_keys,
+                    tavily_keys=config.tavily_api_keys,
+                    serpapi_keys=config.serpapi_keys
+                )
+
+            if config.gemini_api_key:
+                analyzer = GeminiAnalyzer(api_key=config.gemini_api_key)
+
+            picker = StockPicker(analyzer=analyzer, search_service=search_service)
+
+            # 政策分析（如果指定）
+            if args.policy_analysis:
+                logger.info("执行政策分析...")
+                picker.analyze_policy()
+
+            # 执行选股
+            candidates = picker.run()
+
+            if candidates:
+                logger.info(f"选股结果 (共 {len(candidates)} 只):")
+                for i, c in enumerate(candidates, 1):
+                    logger.info(f"  {i}. {c.stock_code} {c.stock_name} "
+                               f"({c.sector_name}) 评分: {c.total_score:.1f}")
+
+                # 发送选股结果通知
+                if not args.no_notify:
+                    from notification import send_stock_picks
+                    logger.info("推送选股结果...")
+                    send_stock_picks(candidates)
+
+                # 将选股结果添加到分析列表
+                if not args.dry_run:
+                    picked_codes = [c.stock_code for c in candidates]
+                    logger.info(f"将选股结果加入分析列表: {picked_codes}")
+                    if stock_codes:
+                        stock_codes = list(set(stock_codes + picked_codes))
+                    else:
+                        stock_codes = picked_codes
+
+            if args.stock_picker and not args.schedule:
+                # 仅选股模式，不继续分析
+                return 0
+
         # 模式2: 定时任务模式
         if args.schedule or config.schedule_enabled:
             logger.info("模式: 定时任务")

@@ -39,3 +39,7 @@ httpx[socks]                # HTTP 客户端 + SOCKS 代理支持（OpenAI 可�
 # SQLite 是 Python 内置，无需额外安装
 
 urllib3
+
+# Web UI V2
+flask>=3.0.0                # Flask Web 框架
+flask-cors>=4.0.0           # CORS 跨域支持

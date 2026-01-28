@@ -2712,18 +2712,110 @@ def get_notification_service() -> NotificationService:
 def send_daily_report(results: List[AnalysisResult]) -> bool:
     """
     发送每日报告的快捷方式
-    
+
     自动识别渠道并推送
     """
     service = get_notification_service()
-    
+
     # 生成报告
     report = service.generate_daily_report(results)
-    
+
     # 保存到本地
     service.save_report_to_file(report)
-    
+
     # 推送到配置的渠道（自动识别）
+    return service.send(report)
+
+
+def format_stock_picks(candidates: list) -> str:
+    """
+    格式化选股结果为 Markdown 文本
+
+    Args:
+        candidates: StockCandidate 列表或字典列表
+
+    Returns:
+        Markdown 格式的选股报告
+    """
+    from datetime import datetime
+
+    today = datetime.now().strftime('%Y-%m-%d')
+    lines = [
+        f"## 今日选股结果 ({today})",
+        "",
+        f"共选出 **{len(candidates)}** 只股票",
+        "",
+        "| 序号 | 代码 | 名称 | 板块 | 策略 | 评分 | 流通市值 |",
+        "|------|------|------|------|------|------|----------|",
+    ]
+
+    for i, c in enumerate(candidates, 1):
+        # 兼容 StockCandidate 对象和字典
+        if hasattr(c, 'stock_code'):
+            code = c.stock_code
+            name = c.stock_name or '-'
+            sector = c.sector_name or '-'
+            strategy = c.strategy or '-'
+            score = c.total_score or 0
+            mv = c.circ_mv or 0
+        else:
+            code = c.get('stock_code', '-')
+            name = c.get('stock_name', '-')
+            sector = c.get('sector_name', '-')
+            strategy = c.get('strategy', '-')
+            score = c.get('total_score', 0)
+            mv = c.get('circ_mv', 0)
+
+        # 策略名称映射
+        strategy_map = {
+            'policy': '政策利好',
+            'hot_sector': '热门板块',
+            'north_flow': '北向资金',
+            'reversal': '板块反转',
+        }
+        strategy_name = strategy_map.get(strategy, strategy)
+
+        mv_str = f"{mv:.0f}亿" if mv > 0 else '-'
+        lines.append(f"| {i} | {code} | {name} | {sector} | {strategy_name} | {score:.1f} | {mv_str} |")
+
+    lines.extend([
+        "",
+        "---",
+        "",
+        "**选股策略说明:**",
+        "- 政策利好: 基于政策分析识别的受益板块",
+        "- 热门板块: 连续2天涨幅榜前5的板块",
+        "- 北向资金: 近3日北向资金净流入时的涨幅榜板块",
+        "- 板块反转: 昨日跌幅榜今日转正的板块",
+        "",
+        "*以上选股结果仅供参考，不构成投资建议。*",
+    ])
+
+    return "\n".join(lines)
+
+
+def send_stock_picks(candidates: list) -> bool:
+    """
+    发送选股结果的快捷方式
+
+    Args:
+        candidates: StockCandidate 列表或字典列表
+
+    Returns:
+        是否发送成功
+    """
+    if not candidates:
+        return False
+
+    service = get_notification_service()
+
+    # 格式化选股结果
+    report = format_stock_picks(candidates)
+
+    # 保存到本地
+    service.save_report_to_file(report, filename_prefix="stock_picks")
+
+    # 推送到配置的渠道
     return service.send(report)
 
 
