@@ -1015,8 +1015,8 @@ class MarketAnalyzer:
             logger.info("[大盘] 调用大模型生成复盘报告...")
 
             generation_config = {
-                'temperature': 0.7,
-                'max_output_tokens': 2048,
+                'temperature': 0.3,
+                'max_output_tokens': 4096,
             }
 
             # 根据 analyzer 使用的 API 类型调用

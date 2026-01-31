@@ -579,7 +579,37 @@ class SearchService:
     def is_available(self) -> bool:
         """检查是否有可用的搜索引擎"""
         return any(p.is_available for p in self._providers)
-    
+
+    def search(self, query: str, max_results: int = 5) -> SearchResponse:
+        """
+        通用搜索方法
+
+        依次尝试各个搜索引擎，直到有一个成功
+
+        Args:
+            query: 搜索关键词
+            max_results: 最大返回结果数
+
+        Returns:
+            SearchResponse 对象
+        """
+        for provider in self._providers:
+            if not provider.is_available:
+                continue
+
+            response = provider.search(query, max_results=max_results)
+
+            if response.success and response.results:
+                return response
+
+        return SearchResponse(
+            query=query,
+            results=[],
+            provider="None",
+            success=False,
+            error_message="所有搜索引擎都不可用或搜索失败"
+        )
+
     def search_stock_news(
         self,
         stock_code: str,

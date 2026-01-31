@@ -419,8 +419,8 @@ class GeminiAnalyzer:
                         {"role": "system", "content": self.SYSTEM_PROMPT},
                         {"role": "user", "content": prompt}
                     ],
-                    temperature=generation_config.get('temperature', 0.7),
-                    max_tokens=generation_config.get('max_output_tokens', 8192),
+                    temperature=generation_config.get('temperature', 0.3),
+                    max_tokens=generation_config.get('max_output_tokens', 16384),
                 )
                 
                 if response and response.choices and response.choices[0].message.content:
@@ -612,8 +612,8 @@ class GeminiAnalyzer:
             
             # 设置生成配置
             generation_config = {
-                "temperature": 0.7,
-                "max_output_tokens": 8192,
+                "temperature": 0.3,
+                "max_output_tokens": 16384,
             }
             
             logger.info(f"[LLM调用] 开始调用 Gemini API (temperature={generation_config['temperature']}, max_tokens={generation_config['max_output_tokens']})...")
@@ -848,6 +848,388 @@ class GeminiAnalyzer:
             return f"{amount / 1e4:.2f} 万元"
         else:
             return f"{amount:.0f} 元"
+    
+    def analyze_batch(
+        self,
+        contexts: List[Dict[str, Any]],
+        news_contexts: Optional[List[Optional[str]]] = None
+    ) -> List[AnalysisResult]:
+        """
+        批量分析多只股票（一次性调用 AI）
+        
+        流程：
+        1. 格式化所有股票的输入数据
+        2. 构建批量分析 Prompt
+        3. 调用 AI 一次性分析所有股票
+        4. 解析 JSON 响应（数组格式）
+        5. 返回结构化结果列表
+        
+        Args:
+            contexts: 技术面数据上下文列表
+            news_contexts: 新闻上下文列表（可选，长度需与 contexts 一致）
+            
+        Returns:
+            AnalysisResult 对象列表
+        """
+        if not contexts:
+            return []
+        
+        if news_contexts is None:
+            news_contexts = [None] * len(contexts)
+        
+        config = get_config()
+        
+        if not self.is_available():
+            return [
+                AnalysisResult(
+                    code=ctx.get('code', 'Unknown'),
+                    name=ctx.get('stock_name', 'Unknown'),
+                    sentiment_score=50,
+                    trend_prediction='震荡',
+                    operation_advice='持有',
+                    confidence_level='低',
+                    analysis_summary='AI 分析功能未启用（未配置 API Key）',
+                    risk_warning='请配置 Gemini API Key 后重试',
+                    success=False,
+                    error_message='Gemini API Key 未配置',
+                )
+                for ctx in contexts
+            ]
+        
+        try:
+            prompt = self._format_batch_prompt(contexts, news_contexts)
+            
+            model_name = getattr(self, '_current_model_name', None)
+            if not model_name:
+                model_name = getattr(self._model, '_model_name', 'unknown')
+            
+            logger.info(f"========== AI 批量分析 {len(contexts)} 只股票 ==========")
+            logger.info(f"[LLM配置] 模型: {model_name}")
+            logger.info(f"[LLM配置] Prompt 长度: {len(prompt)} 字符")
+            
+            prompt_preview = prompt[:800] + "..." if len(prompt) > 800 else prompt
+            logger.info(f"[LLM Prompt 预览]\n{prompt_preview}")
+            
+            generation_config = {
+                "temperature": 0.3,
+                "max_output_tokens": 32768,
+            }
+            
+            logger.info(f"[LLM调用] 开始调用 Gemini API (temperature={generation_config['temperature']}, max_tokens={generation_config['max_output_tokens']})...")
+            
+            start_time = time.time()
+            response_text = self._call_api_with_retry(prompt, generation_config)
+            elapsed = time.time() - start_time
+            
+            logger.info(f"[LLM返回] Gemini API 响应成功, 耗时 {elapsed:.2f}s, 响应长度 {len(response_text)} 字符")
+            
+            response_preview = response_text[:500] + "..." if len(response_text) > 500 else response_text
+            logger.info(f"[LLM返回 预览]\n{response_preview}")
+            
+            results = self._parse_batch_response(response_text, contexts)
+            
+            for r in results:
+                r.raw_response = response_text
+                r.search_performed = bool(news_contexts)
+            
+            logger.info(f"[LLM解析] 批量分析完成: 成功 {len(results)} 只")
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"AI 批量分析失败: {e}")
+            return [
+                AnalysisResult(
+                    code=ctx.get('code', 'Unknown'),
+                    name=ctx.get('stock_name', 'Unknown'),
+                    sentiment_score=50,
+                    trend_prediction='震荡',
+                    operation_advice='持有',
+                    confidence_level='低',
+                    analysis_summary=f'批量分析失败: {str(e)[:100]}',
+                    risk_warning='分析失败，请稍后重试或手动分析',
+                    success=False,
+                    error_message=str(e),
+                )
+                for ctx in contexts
+            ]
+    
+    def _format_batch_prompt(
+        self,
+        contexts: List[Dict[str, Any]],
+        news_contexts: List[Optional[str]]
+    ) -> str:
+        """
+        格式化批量分析 Prompt
+        
+        将多只股票的数据组合成一个 Prompt，要求 AI 返回 JSON 数组格式
+        
+        Args:
+            contexts: 技术面数据上下文列表
+            news_contexts: 新闻上下文列表
+            
+        Returns:
+            完整的批量分析 Prompt
+        """
+        prompt = """# 批量决策仪表盘分析请求
+
+你是一位专注于趋势交易的 A 股投资分析师，请分析以下多只股票，生成【决策仪表盘】。
+
+## 分析股票列表
+
+"""
+        
+        for i, (ctx, news) in enumerate(zip(contexts, news_contexts), 1):
+            code = ctx.get('code', 'Unknown')
+            stock_name = ctx.get('stock_name', STOCK_NAME_MAP.get(code, f'股票{code}'))
+            
+            prompt += f"--- 股票 {i}: {stock_name}({code}) ---\n\n"
+            
+            today = ctx.get('today', {})
+            latest = ctx.get('latest', {})
+            
+            prompt += f"## 最新行情\n"
+            prompt += f"- 收盘价: {latest.get('close', 0):.2f}\n"
+            prompt += f"- 涨跌幅: {latest.get('pct_chg', 0):.2f}%\n"
+            prompt += f"- 成交量: {self._format_volume(latest.get('volume'))}\n"
+            prompt += f"- 成交额: {self._format_amount(latest.get('amount'))}\n"
+            
+            if 'realtime' in ctx:
+                rt = ctx['realtime']
+                prompt += f"- 换手率: {rt.get('turnover_rate', 0):.2f}%\n"
+                prompt += f"- 量比: {rt.get('volume_ratio', 0):.2f}\n"
+                prompt += f"- PE: {rt.get('pe_ratio', 0):.1f}\n"
+                prompt += f"- PB: {rt.get('pb_ratio', 0):.1f}\n"
+            
+            prompt += f"\n## 技术指标\n"
+            prompt += f"- MA5: {latest.get('ma5', 0):.2f} | MA10: {latest.get('ma10', 0):.2f} | MA20: {latest.get('ma20', 0):.2f}\n"
+            prompt += f"- 量比: {latest.get('volume_ratio', 0):.2f}\n"
+            
+            if 'trend_analysis' in ctx:
+                ta = ctx['trend_analysis']
+                prompt += f"- 趋势状态: {ta.get('trend_status', 'unknown')}\n"
+                prompt += f"- 买入信号: {ta.get('buy_signal', 'unknown')}\n"
+                prompt += f"- 信号评分: {ta.get('signal_score', 0)}\n"
+            
+            if 'chip' in ctx:
+                chip = ctx['chip']
+                prompt += f"- 获利比例: {chip.get('profit_ratio', 0):.1%}\n"
+                prompt += f"- 90%集中度: {chip.get('concentration_90', 0):.2%}\n"
+                prompt += f"- 平均成本: {chip.get('avg_cost', 0):.2f}\n"
+            
+            if news:
+                prompt += f"\n## 舆情情报\n{news}\n"
+            
+            prompt += "\n"
+        
+        prompt += """## 输出要求
+
+请以 JSON 数组格式返回分析结果，每个元素是一个完整的决策仪表盘 JSON 对象。
+
+每个 JSON 对象必须包含以下所有字段：
+
+```json
+{
+    "code": "000001",
+    "sentiment_score": 0-100整数,
+    "trend_prediction": "强烈看多/看多/震荡/看空/强烈看空",
+    "operation_advice": "买入/加仓/持有/减仓/卖出/观望",
+    "confidence_level": "高/中/低",
+    
+    "dashboard": {
+        "core_conclusion": {
+            "one_sentence": "一句话核心结论（30字以内）",
+            "signal_type": "🟢买入信号/🟡持有观望/🔴卖出信号/⚠️风险警告",
+            "time_sensitivity": "立即行动/今日内/本周内/不急",
+            "position_advice": {
+                "no_position": "空仓者建议：具体操作指引",
+                "has_position": "持仓者建议：具体操作指引"
+            }
+        },
+        "data_perspective": {
+            "trend_status": {
+                "ma_alignment": "均线排列状态描述",
+                "is_bullish": true/false,
+                "trend_score": 0-100
+            },
+            "price_position": {
+                "current_price": 当前价格数值,
+                "ma5": MA5数值,
+                "ma10": MA10数值,
+                "ma20": MA20数值,
+                "bias_ma5": 乖离率百分比数值,
+                "bias_status": "安全/警戒/危险",
+                "support_level": 支撑位价格,
+                "resistance_level": 压力位价格
+            },
+            "volume_analysis": {
+                "volume_ratio": 量比数值,
+                "volume_status": "放量/缩量/平量",
+                "turnover_rate": 换手率百分比,
+                "volume_meaning": "量能含义解读"
+            },
+            "chip_structure": {
+                "profit_ratio": 获利比例,
+                "avg_cost": 平均成本,
+                "concentration": 筹码集中度,
+                "chip_health": "健康/一般/警惕"
+            }
+        },
+        "intelligence": {
+            "latest_news": "最新消息摘要",
+            "risk_alerts": ["风险点1", "风险点2"],
+            "positive_catalysts": ["利好1", "利好2"],
+            "earnings_outlook": "业绩预期分析",
+            "sentiment_summary": "舆情情绪一句话总结"
+        },
+        "battle_plan": {
+            "sniper_points": {
+                "ideal_buy": "理想买入点：XX元",
+                "secondary_buy": "次优买入点：XX元",
+                "stop_loss": "止损位：XX元",
+                "take_profit": "目标位：XX元"
+            },
+            "position_strategy": {
+                "suggested_position": "建议仓位：X成",
+                "entry_plan": "分批建仓策略描述",
+                "risk_control": "风控策略描述"
+            },
+            "action_checklist": [
+                "检查项1：多头排列",
+                "检查项2：乖离率<5%",
+                "检查项3：量能配合"
+            ]
+        }
+    },
+    
+    "analysis_summary": "100字综合分析摘要",
+    "key_points": "3-5个核心看点",
+    "risk_warning": "风险提示",
+    "buy_reason": "操作理由",
+    
+    "trend_analysis": "走势形态分析",
+    "short_term_outlook": "短期展望",
+    "medium_term_outlook": "中期展望",
+    "technical_analysis": "技术面综合分析",
+    "ma_analysis": "均线系统分析",
+    "volume_analysis": "量能分析",
+    "pattern_analysis": "K线形态分析",
+    "fundamental_analysis": "基本面分析",
+    "sector_position": "板块行业分析",
+    "company_highlights": "公司亮点/风险",
+    "news_summary": "新闻摘要",
+    "market_sentiment": "市场情绪",
+    "hot_topics": "相关热点",
+    
+    "search_performed": true/false
+}
+```
+
+注意：
+1. 必须返回 JSON 数组，元素个数与分析股票数一致
+2. 每个 JSON 对象必须包含 code 字段用于匹配
+3. dashboard 字段必须包含所有子对象和字段
+4. 详细分析字段（trend_analysis, technical_analysis 等）也必须填写
+"""
+        return prompt
+    
+    def _parse_batch_response(
+        self,
+        response_text: str,
+        contexts: List[Dict[str, Any]]
+    ) -> List[AnalysisResult]:
+        """
+        解析批量分析响应（JSON 数组格式）
+        
+        Args:
+            response_text: AI 返回的响应文本
+            contexts: 原始上下文列表（用于匹配股票代码）
+            
+        Returns:
+            AnalysisResult 对象列表
+        """
+        try:
+            data = json.loads(response_text)
+            
+            if not isinstance(data, list):
+                logger.error(f"批量分析响应不是数组格式: {type(data)}")
+                return self._create_fallback_results(contexts, "响应格式错误")
+            
+            results = []
+            code_to_context = {ctx.get('code'): ctx for ctx in contexts}
+            seen_codes = set()  # 用于去重
+            
+            for item in data:
+                code = item.get('code', '')
+                
+                # 去重：如果已存在相同代码，跳过
+                if code in seen_codes:
+                    logger.warning(f"批量分析结果包含重复股票代码: {code}，跳过")
+                    continue
+                
+                seen_codes.add(code)
+                
+                ctx = code_to_context.get(code)
+                
+                if not ctx:
+                    logger.warning(f"批量分析结果包含未知股票代码: {code}")
+                    continue
+                
+                name = ctx.get('stock_name', STOCK_NAME_MAP.get(code, f'股票{code}'))
+                
+                result = AnalysisResult(
+                    code=code,
+                    name=name,
+                    sentiment_score=item.get('sentiment_score', 50),
+                    trend_prediction=item.get('trend_prediction', '震荡'),
+                    operation_advice=item.get('operation_advice', '持有'),
+                    confidence_level=item.get('confidence_level', '低'),
+                    analysis_summary=item.get('analysis_summary', ''),
+                    risk_warning=item.get('risk_warning', ''),
+                    success=True,
+                )
+                
+                results.append(result)
+            
+            return results
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"批量分析响应 JSON 解析失败: {e}")
+            return self._create_fallback_results(contexts, "JSON 解析失败")
+        except Exception as e:
+            logger.error(f"批量分析响应解析失败: {e}")
+            return self._create_fallback_results(contexts, str(e)[:100])
+    
+    def _create_fallback_results(
+        self,
+        contexts: List[Dict[str, Any]],
+        error_msg: str
+    ) -> List[AnalysisResult]:
+        """
+        创建回退结果（批量分析失败时使用）
+        
+        Args:
+            contexts: 原始上下文列表
+            error_msg: 错误信息
+            
+        Returns:
+            AnalysisResult 对象列表
+        """
+        return [
+            AnalysisResult(
+                code=ctx.get('code', 'Unknown'),
+                name=ctx.get('stock_name', 'Unknown'),
+                sentiment_score=50,
+                trend_prediction='震荡',
+                operation_advice='持有',
+                confidence_level='低',
+                analysis_summary=f'批量分析失败: {error_msg}',
+                risk_warning='分析失败，请稍后重试或手动分析',
+                success=False,
+                error_message=error_msg,
+            )
+            for ctx in contexts
+        ]
     
     def _parse_response(
         self, 

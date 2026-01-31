@@ -281,20 +281,33 @@ npm install
 
 ### 5.2 启动方式
 
-#### 方式一：全功能命令行模式
+#### 方式一：完整分析流程（推荐）
 
 ```bash
-# 执行选股 + 大盘复盘 + 个股分析（完整流程）
+# 完整流程：政策分析 → 选股 → 个股分析 → 大盘复盘
+python main.py --full-analysis
+```
+
+这是最推荐的使用方式，会按顺序执行：
+1. **大盘复盘**：获取市场数据和板块涨跌榜，保存到数据库（为选股提供数据基础）
+2. **政策分析**：搜索最新政策新闻，识别利好/利空板块
+3. **智能选股**：基于板块数据 + 政策分析 + 技术指标选出候选股
+4. **个股分析**：对选出的每只股票进行 AI 深度分析
+
+#### 方式二：单独模块执行
+
+```bash
+# 仅执行选股（不进行个股分析）
 python main.py --stock-picker
 
-# 仅执行选股
-python main.py --stock-picker --no-notify
-
-# 执行政策分析 + 选股
-python main.py --policy-analysis --stock-picker
+# 仅执行政策分析
+python main.py --policy-analysis
 
 # 仅执行大盘复盘
 python main.py --market-review
+
+# 选股 + 政策分析（但不进行个股 AI 分析）
+python main.py --stock-picker --policy-analysis
 ```
 
 #### 方式二：Web UI V2 模式（推荐）

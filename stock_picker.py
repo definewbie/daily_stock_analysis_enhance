@@ -13,6 +13,8 @@
 
 import logging
 import json
+import random
+import time
 from datetime import datetime, date, timedelta
 from typing import Dict, List, Any, Optional
 from dataclasses import dataclass, field
@@ -20,6 +22,7 @@ from dataclasses import dataclass, field
 import akshare as ak
 
 from config import get_config
+from data_provider import DataFetcherManager
 from storage import (
     get_db,
     MarketState,
@@ -128,6 +131,9 @@ class StockPicker:
         self.db = get_db()
         self.analyzer = analyzer
         self.search_service = search_service
+        
+        # 数据获取器管理器（自动 fallback）
+        self.fetcher_manager = DataFetcherManager()
 
         # 配置
         self.markets = ['SH', 'SZ']  # 仅A股
@@ -159,6 +165,9 @@ class StockPicker:
         if not candidates:
             logger.warning("[选股] 宏观层无候选股，跳过技术层筛选")
             return []
+
+        # 2.5. 确保候选股票的日线数据已存在
+        self._ensure_stock_data_exist(candidates)
 
         # 3. 技术层筛选：评分和过滤
         candidates = self._tech_selection(candidates, mv_threshold)
@@ -225,6 +234,73 @@ class StockPicker:
         logger.info(f"[选股] 策略D(板块反转): {len(reversal_candidates)} 只")
 
         return candidates
+
+    def _ensure_stock_data_exist(self, candidates: List[StockCandidate]):
+        """
+        确保候选股票的日线数据已获取并存储到数据库
+        
+        防反爬策略：
+        - 串行处理，避免并发请求
+        - 每次请求前随机休眠 3-8 秒
+        - 捕获异常并提供降级方案（跳过失败股票）
+        - 利用 DataFetcherManager 的自动 fallback 机制
+        """
+        today = date.today()
+        codes_to_fetch = []
+        
+        for c in candidates:
+            if not self.db.has_today_data(c.stock_code, today):
+                codes_to_fetch.append(c.stock_code)
+        
+        if not codes_to_fetch:
+            logger.info(f"[选股] 所有候选股票数据已存在，无需获取")
+            return
+        
+        logger.info(f"[选股] 开始获取 {len(codes_to_fetch)} 只候选股票的日线数据")
+        
+        success_count = 0
+        failed_codes = []
+        
+        for i, code in enumerate(codes_to_fetch, 1):
+            try:
+                sleep_time = random.uniform(3.0, 8.0)
+                logger.info(f"[选股] 获取数据进度 {i}/{len(codes_to_fetch)}: {code}, 休眠 {sleep_time:.1f}秒")
+                time.sleep(sleep_time)
+                
+                df, source_name = self.fetcher_manager.get_daily_data(code, days=30)
+                
+                if df is None or df.empty:
+                    logger.warning(f"[选股] {code} 数据为空，跳过")
+                    failed_codes.append(code)
+                    continue
+                
+                saved_count = self.db.save_daily_data(df, code, source_name)
+                success_count += 1
+                logger.info(f"[选股] {code} 数据保存成功（来源: {source_name}, 新增 {saved_count} 条）")
+                
+            except Exception as e:
+                error_msg = str(e)
+                if 'Proxy' in error_msg or 'Connection' in error_msg or 'timeout' in error_msg.lower():
+                    logger.warning(f"[选股] {code} 网络问题: {error_msg}")
+                elif '403' in error_msg or '429' in error_msg:
+                    logger.error(f"[选股] {code} 可能被反爬: {error_msg}, 建议稍后重试")
+                else:
+                    logger.warning(f"[选股] {code} 获取数据失败: {error_msg}")
+                
+                failed_codes.append(code)
+                
+                if len(failed_codes) >= 3:
+                    extra_sleep = random.uniform(10.0, 20.0)
+                    logger.warning(f"[选股] 连续失败 {len(failed_codes)} 次，额外休眠 {extra_sleep:.1f}秒")
+                    time.sleep(extra_sleep)
+        
+        logger.info(f"[选股] 数据获取完成: 成功 {success_count}, 失败 {len(failed_codes)}")
+        
+        if failed_codes:
+            original_count = len(candidates)
+            candidates[:] = [c for c in candidates if c.stock_code not in failed_codes]
+            removed_count = original_count - len(candidates)
+            logger.warning(f"[选股] 因数据获取失败，移除 {removed_count} 只候选股")
 
     def _strategy_policy(self, target_date: date) -> List[StockCandidate]:
         """策略A: 政策利好板块选股"""
@@ -379,15 +455,20 @@ class StockPicker:
     def _fetch_sector_stocks(self, sector_name: str) -> List[SectorStock]:
         """从接口获取板块成分股"""
         try:
+            # 尝试从东方财富获取板块成分股
             df = ak.stock_board_industry_cons_em(symbol=sector_name)
 
-            if df is None or df.empty:
+            if df is None or len(df) == 0:
+                logger.debug(f"[选股] 板块 {sector_name} 无成分股数据")
                 return []
 
             stocks = []
             for _, row in df.iterrows():
                 code = str(row.get('代码', ''))
                 name = str(row.get('名称', ''))
+
+                if not code:
+                    continue
 
                 # 判断市场
                 if code.startswith('6'):
@@ -403,13 +484,23 @@ class StockPicker:
                     'market': market,
                 })
 
-            # 保存到数据库
-            self.db.save_sector_stocks(sector_name, stocks)
+            if stocks:
+                # 保存到数据库
+                self.db.save_sector_stocks(sector_name, stocks)
+                logger.info(f"[选股] 获取板块成分股成功 {sector_name}: {len(stocks)} 只")
 
             return self.db.get_sector_stocks(sector_name)
 
+        except IndexError:
+            # akshare 返回空数据时可能抛出 IndexError
+            logger.debug(f"[选股] 板块 {sector_name} 暂无成分股数据")
+            return []
         except Exception as e:
-            logger.warning(f"[选股] 获取板块成分股失败 {sector_name}: {e}")
+            error_msg = str(e)
+            if 'Proxy' in error_msg or 'Connection' in error_msg:
+                logger.warning(f"[选股] 网络问题，无法获取板块成分股 {sector_name}")
+            else:
+                logger.warning(f"[选股] 获取板块成分股失败 {sector_name}: {e}")
             return []
 
     def _tech_selection(
@@ -642,7 +733,8 @@ class StockPicker:
 
     def _search_policy_news(self) -> List[Dict[str, Any]]:
         """搜索政策新闻"""
-        if not self.search_service:
+        if not self.search_service or not self.search_service.is_available:
+            logger.warning("[选股] 搜索服务不可用，跳过政策新闻搜索")
             return []
 
         today = datetime.now()
@@ -657,11 +749,20 @@ class StockPicker:
         all_news = []
         for query in queries:
             try:
-                results = self.search_service.search(query, max_results=3)
-                all_news.extend(results)
+                response = self.search_service.search(query, max_results=3)
+                if response.success and response.results:
+                    # 将 SearchResult 对象转换为字典
+                    for result in response.results:
+                        all_news.append({
+                            'title': result.title,
+                            'snippet': result.snippet,
+                            'url': result.url,
+                            'source': result.source,
+                        })
             except Exception as e:
                 logger.warning(f"[选股] 搜索政策新闻失败: {e}")
 
+        logger.info(f"[选股] 搜索到 {len(all_news)} 条政策新闻")
         return all_news[:10]
 
     def _analyze_policy_with_llm(self, news: List) -> List[Dict[str, Any]]:

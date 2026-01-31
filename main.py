@@ -659,16 +659,19 @@ def parse_arguments() -> argparse.Namespace:
         description='A股自选股智能分析系统',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
-示例:
-  python main.py                    # 正常运行
-  python main.py --debug            # 调试模式
-  python main.py --dry-run          # 仅获取数据，不进行 AI 分析
-  python main.py --stocks 600519,000001  # 指定分析特定股票
-  python main.py --no-notify        # 不发送推送通知
-  python main.py --single-notify    # 启用单股推送模式（每分析完一只立即推送）
-  python main.py --schedule         # 启用定时任务模式
-  python main.py --market-review    # 仅运行大盘复盘
-        '''
+ 示例:
+   python main.py                    # 正常运行
+   python main.py --debug            # 调试模式
+   python main.py --dry-run          # 仅获取数据，不进行 AI 分析
+   python main.py --stocks 600519,000001  # 指定分析特定股票
+   python main.py --no-notify        # 不发送推送通知
+   python main.py --single-notify    # 启用单股推送模式（每分析完一只立即推送）
+   python main.py --schedule         # 启用定时任务模式
+   python main.py --market-review    # 仅运行大盘复盘
+   python main.py --stock-picker     # 启用选股功能
+   python main.py --policy-analysis  # 执行政策分析
+   python main.py --full-analysis    # 执行完整分析流程
+         '''
     )
     
     parser.add_argument(
@@ -742,6 +745,12 @@ def parse_arguments() -> argparse.Namespace:
         '--policy-analysis',
         action='store_true',
         help='执行政策分析（盘前/盘后）'
+    )
+
+    parser.add_argument(
+        '--full-analysis',
+        action='store_true',
+        help='执行完整分析流程（政策分析 → 选股 → 个股分析 → 大盘复盘）'
     )
 
     parser.add_argument(
@@ -833,40 +842,103 @@ def run_full_analysis(
     stock_codes: Optional[List[str]] = None
 ):
     """
-    执行完整的分析流程（个股 + 大盘复盘）
-    
+    执行完整的分析流程（大盘复盘 → 政策分析 → 选股 → 个股分析）
+
+    正确的执行顺序：
+    1. 大盘复盘 - 获取市场数据和板块数据，保存到数据库
+    2. 政策分析 - 搜索政策新闻，识别利好板块
+    3. 选股 - 基于板块数据和政策分析结果选股
+    4. 个股分析 - 对选出的股票进行 AI 分析
+
     这是定时任务调用的主函数
     """
     try:
         # 命令行参数 --single-notify 覆盖配置（#55）
         if getattr(args, 'single_notify', False):
             config.single_stock_notify = True
-        
+
         # 创建调度器
         pipeline = StockAnalysisPipeline(
             config=config,
             max_workers=args.workers
         )
-        
-        # 1. 运行个股分析
-        results = pipeline.run(
-            stock_codes=stock_codes,
-            dry_run=args.dry_run,
-            send_notification=not args.no_notify
-        )
-        
-        # 2. 运行大盘复盘（如果启用且不是仅个股模式）
+
+        # === 第一步：大盘复盘（获取板块数据，为选股做准备）===
+        logger.info("=" * 50)
+        logger.info("[步骤 1/4] 大盘复盘 - 获取市场和板块数据")
+        logger.info("=" * 50)
         market_report = ""
-        if config.market_review_enabled and not args.no_market_review:
-            # 只调用一次，并获取结果
+        if config.market_review_enabled and not getattr(args, 'no_market_review', False):
             review_result = run_market_review(
                 notifier=pipeline.notifier,
                 analyzer=pipeline.analyzer,
                 search_service=pipeline.search_service
             )
-            # 如果有结果，赋值给 market_report 用于后续飞书文档生成
             if review_result:
                 market_report = review_result
+                logger.info("大盘复盘完成，板块数据已保存到数据库")
+        else:
+            logger.info("跳过大盘复盘")
+
+        # === 第二步：政策分析 ===
+        logger.info("=" * 50)
+        logger.info("[步骤 2/4] 政策分析 - 识别利好板块")
+        logger.info("=" * 50)
+        policy_analyses = []
+        try:
+            if config.stock_picker_enabled or getattr(args, 'policy_analysis', False) or getattr(args, 'full_analysis', False):
+                from stock_picker import StockPicker
+                picker = StockPicker(analyzer=pipeline.analyzer, search_service=pipeline.search_service)
+                policy_analyses = picker.analyze_policy(session_type='pre')
+                if policy_analyses:
+                    logger.info(f"政策分析完成，识别出 {len(policy_analyses)} 个影响板块")
+                else:
+                    logger.info("政策分析完成，未识别出明显影响板块")
+        except Exception as e:
+            logger.error(f"政策分析失败: {e}")
+
+        # === 第三步：选股 ===
+        logger.info("=" * 50)
+        logger.info("[步骤 3/4] 智能选股 - 基于板块和技术指标")
+        logger.info("=" * 50)
+        candidates = []
+        try:
+            if config.stock_picker_enabled or getattr(args, 'stock_picker', False) or getattr(args, 'full_analysis', False):
+                from stock_picker import StockPicker
+                picker = StockPicker(analyzer=pipeline.analyzer, search_service=pipeline.search_service)
+                candidates = picker.run()
+                if candidates:
+                    logger.info(f"选股完成，选出 {len(candidates)} 只候选股:")
+                    for i, c in enumerate(candidates, 1):
+                        logger.info(f"  {i}. {c.stock_code} {c.stock_name} ({c.sector_name}) 评分: {c.total_score:.1f}")
+                    # 将候选股添加到分析列表
+                    picked_codes = [c.stock_code for c in candidates]
+                    if stock_codes:
+                        stock_codes = list(set(stock_codes + picked_codes))
+                    else:
+                        stock_codes = picked_codes
+                else:
+                    logger.warning("选股完成，但未选出任何候选股（可能缺少板块数据）")
+        except Exception as e:
+            logger.error(f"选股失败: {e}")
+
+        # === 第四步：个股分析 ===
+        logger.info("=" * 50)
+        logger.info("[步骤 4/4] 个股分析 - AI 深度分析")
+        logger.info("=" * 50)
+        if stock_codes:
+            logger.info(f"将分析 {len(stock_codes)} 只股票: {stock_codes}")
+        else:
+            logger.warning("没有股票需要分析（选股未返回结果且未指定 STOCK_LIST）")
+        
+        if args.dry_run:
+            results = pipeline.run(
+                stock_codes=stock_codes,
+                dry_run=True,
+                send_notification=False
+            )
+        else:
+            results = analyze_stocks_batch(pipeline, stock_codes, not args.no_notify)
         
         # 输出摘要
         if results:
@@ -885,36 +957,203 @@ def run_full_analysis(
             feishu_doc = FeishuDocManager()
             if feishu_doc.is_configured() and (results or market_report):
                 logger.info("正在创建飞书云文档...")
-
+                
                 # 1. 准备标题 "01-01 13:01大盘复盘"
                 tz_cn = timezone(timedelta(hours=8))
                 now = datetime.now(tz_cn)
                 doc_title = f"{now.strftime('%Y-%m-%d %H:%M')} 大盘复盘"
-
+                
                 # 2. 准备内容 (拼接个股分析和大盘复盘)
                 full_content = ""
-
+                
+                # 添加策略分析（如果有）
+                if policy_analyses:
+                    full_content += f"# 📊 政策分析\n\n"
+                    for analysis in policy_analyses:
+                        impact = "利好" if analysis.get('impact_type') == 'positive' else "利空"
+                        full_content += f"- **{analysis.get('sector')}**: {impact} ({analysis.get('score')} 分) - {analysis.get('reason')}\n"
+                    full_content += "\n---\n\n"
+                
+                # 添加选股结果（如果有）
+                if candidates:
+                    full_content += f"# 📈 选股结果\n\n"
+                    for i, c in enumerate(candidates, 1):
+                        full_content += f"{i}. **{c.stock_name}({c.stock_code})** | 板块: {c.sector_name} | 总分: {c.total_score:.1f}\n"
+                    full_content += "\n---\n\n"
+                
                 # 添加大盘复盘内容（如果有）
                 if market_report:
                     full_content += f"# 📈 大盘复盘\n\n{market_report}\n\n---\n\n"
-
+                
                 # 添加个股决策仪表盘（使用 NotificationService 生成）
                 if results:
                     dashboard_content = pipeline.notifier.generate_dashboard_report(results)
                     full_content += f"# 🚀 个股决策仪表盘\n\n{dashboard_content}"
-
+                
                 # 3. 创建文档
                 doc_url = feishu_doc.create_daily_doc(doc_title, full_content)
                 if doc_url:
                     logger.info(f"飞书云文档创建成功: {doc_url}")
                     # 可选：将文档链接也推送到群里
                     pipeline.notifier.send(f"[{now.strftime('%Y-%m-%d %H:%M')}] 复盘文档创建成功: {doc_url}")
-
+        
         except Exception as e:
             logger.error(f"飞书文档生成失败: {e}")
         
     except Exception as e:
         logger.exception(f"分析流程执行失败: {e}")
+
+
+def analyze_stocks_batch(
+    pipeline: 'StockAnalysisPipeline',
+    stock_codes: Optional[List[str]],
+    send_notification: bool = True
+) -> List[AnalysisResult]:
+    """
+    批量分析股票（使用一次 AI 调用）
+    
+    流程：
+    1. 并发获取所有股票的数据（实时行情、筹码、趋势分析、新闻）
+    2. 收集所有股票的上下文数据
+    3. 一次性调用 AI 批量分析
+    4. 发送通知
+    
+    Args:
+        pipeline: 分析流水线
+        stock_codes: 股票代码列表
+        send_notification: 是否发送通知
+        
+    Returns:
+        AnalysisResult 对象列表
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    
+    if not stock_codes:
+        logger.warning("股票代码列表为空")
+        return []
+    
+    logger.info(f"开始批量分析 {len(stock_codes)} 只股票")
+    
+    contexts = []
+    news_contexts = []
+    
+    with ThreadPoolExecutor(max_workers=pipeline.max_workers) as executor:
+        future_to_code = {}
+        
+        for code in stock_codes:
+            future = executor.submit(
+                _collect_stock_data,
+                pipeline,
+                code
+            )
+            future_to_code[future] = code
+        
+        for future in as_completed(future_to_code):
+            code = future_to_code[future]
+            try:
+                ctx, news = future.result()
+                if ctx:
+                    contexts.append(ctx)
+                    news_contexts.append(news)
+                else:
+                    logger.warning(f"[{code}] 数据收集失败，跳过分析")
+            except Exception as e:
+                logger.error(f"[{code}] 数据收集失败: {e}")
+    
+    if not contexts:
+        logger.warning("没有可用的股票数据")
+        return []
+    
+    logger.info(f"成功收集 {len(contexts)} 只股票的数据，开始 AI 批量分析")
+    
+    results = pipeline.analyzer.analyze_batch(contexts, news_contexts)
+    
+    if results and send_notification:
+        pipeline._send_notifications(results)
+    
+    return results
+
+
+def _collect_stock_data(
+    pipeline: 'StockAnalysisPipeline',
+    code: str
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """
+    收集单只股票的所有数据
+    
+    Args:
+        pipeline: 分析流水线
+        code: 股票代码
+        
+    Returns:
+        (context, news_context) 元组
+    """
+    try:
+        success, error = pipeline.fetch_and_save_stock_data(code)
+        
+        if not success:
+            logger.warning(f"[{code}] 数据获取失败: {error}")
+            return None, None
+        
+        stock_name = STOCK_NAME_MAP.get(code, '')
+        
+        realtime_quote = None
+        try:
+            realtime_quote = pipeline.akshare_fetcher.get_realtime_quote(code)
+            if realtime_quote and realtime_quote.name:
+                stock_name = realtime_quote.name
+        except Exception as e:
+            logger.debug(f"[{code}] 获取实时行情失败: {e}")
+        
+        chip_data = None
+        try:
+            chip_data = pipeline.akshare_fetcher.get_chip_distribution(code)
+        except Exception as e:
+            logger.debug(f"[{code}] 获取筹码分布失败: {e}")
+        
+        trend_result = None
+        try:
+            context = pipeline.db.get_analysis_context(code)
+            if context and 'raw_data' in context:
+                import pandas as pd
+                raw_data = context['raw_data']
+                if isinstance(raw_data, list) and len(raw_data) > 0:
+                    df = pd.DataFrame(raw_data)
+                    trend_result = pipeline.trend_analyzer.analyze(df, code)
+        except Exception as e:
+            logger.debug(f"[{code}] 趋势分析失败: {e}")
+        
+        news_context = None
+        if pipeline.search_service.is_available:
+            try:
+                intel_results = pipeline.search_service.search_comprehensive_intel(
+                    stock_code=code,
+                    stock_name=stock_name or f'股票{code}',
+                    max_searches=2
+                )
+                if intel_results:
+                    news_context = pipeline.search_service.format_intel_report(intel_results, stock_name)
+            except Exception as e:
+                logger.debug(f"[{code}] 情报搜索失败: {e}")
+        
+        context = pipeline.db.get_analysis_context(code)
+        
+        if context is None:
+            return None, None
+        
+        enhanced_context = pipeline._enhance_context(
+            context,
+            realtime_quote,
+            chip_data,
+            trend_result,
+            stock_name or f'股票{code}'
+        )
+        
+        return enhanced_context, news_context
+        
+    except Exception as e:
+        logger.error(f"[{code}] 收集数据失败: {e}")
+        return None, None
 
 
 def main() -> int:
@@ -976,6 +1215,17 @@ def main() -> int:
             logger.info(f"启动 Web UI V2 (端口: {args.webui_v2_port})")
             from webui_v2 import run_webui_v2
             run_webui_v2(host='127.0.0.1', port=args.webui_v2_port, debug=args.debug)
+            return 0
+
+        # 模式0.5: 完整分析流程（最高优先级）
+        # 政策分析 → 选股 → 个股分析 → 大盘复盘
+        if getattr(args, 'full_analysis', False):
+            logger.info("=" * 60)
+            logger.info("模式: 完整分析流程")
+            logger.info("流程: 政策分析 → 选股 → 个股分析 → 大盘复盘")
+            logger.info("=" * 60)
+            run_full_analysis(config, args, stock_codes)
+            logger.info("\n完整分析流程执行完成")
             return 0
 
         # 模式1: 仅大盘复盘
